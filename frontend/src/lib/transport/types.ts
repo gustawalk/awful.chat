@@ -2,13 +2,46 @@ export interface TransportEvents {
   connect: (peerId: string) => void;
   disconnect: (peerId: string) => void;
   message: (peerId: string, data: Uint8Array, room: string | null) => void;
+  /**
+   * The relay told us who is registered in a room (its PEERS reply, or a
+   * PEER_JOINED). Membership is what gates telling a peer that a room exists,
+   * so this is the moment history can be reconciled with them.
+   */
+  roomPeers: (room: string, peerIds: string[]) => void;
   status: (status: TransportStatus) => void;
+  /**
+   * A peer's path changed between a relay circuit and a direct connection.
+   *
+   * The transport knows this the moment it happens, but the UI could not:
+   * isRelayed() looks inside a plain Set, so a template that calls it renders
+   * a snapshot and never hears about an upgrade. This event is what turns
+   * that into reactive state.
+   */
+  relayChanged: (peerId: string, relayed: boolean) => void;
+  /**
+   * A peer's outbound stream has proof the far side is reading it - the
+   * first pong on THIS stream, not merely a connection reporting "open".
+   * connectedPeers (and the peers this mirrors into) never gated on this,
+   * so a link that connects but carries nothing rendered exactly like a
+   * working one. streamLost fires when that proof is withdrawn: the
+   * stream is torn down, reset, or never confirms.
+   *
+   * Both carry the FULL peer id, like every other peer-naming event here.
+   */
+  streamProven: (peerId: string) => void;
+  streamLost: (peerId: string) => void;
 }
 
+/**
+ * Transient banners. `peerId`, where present, is always the FULL peer id -
+ * `message` may shorten it for a human, but UI code matches a peer by
+ * `peerId`, and a sliced id cannot address one.
+ */
 export type TransportStatus =
   | { type: "app-warning"; message: string }
   | { type: "relay-connected"; message: string }
   | { type: "relay-disconnected"; message: string }
+  | { type: "relay-dial-retry"; message: string }
   | { type: "relay-dial-failed"; message: string }
   | { type: "relay-reconnect-failed"; message: string }
   | { type: "relay-reconnecting"; message: string }
@@ -17,19 +50,7 @@ export type TransportStatus =
   | { type: "rendezvous-reconnecting"; message: string }
   | { type: "reservation-timeout"; message: string }
   | { type: "voice-dial-failed"; peerId: string; message: string }
-  | {
-      type: "voice-dial-retrying";
-      peerId: string;
-      attempt: number;
-      message: string;
-    }
   | { type: "voice-peer-left"; peerId: string; message: string }
-  | {
-      type: "voice-glare-resolved";
-      peerId: string;
-      winner: string;
-      message: string;
-    }
   | { type: "peer-dial-failed"; peerId: string; message: string }
   | { type: "voice-connection-failed"; peerId: string; message: string }
   | {
@@ -60,6 +81,11 @@ export interface PeerTransport {
   peers(): string[];
   selfId(): string;
   isRelayed(peerId: string): boolean;
+  /**
+   * Round-trip time to a peer in milliseconds, or null when it did not
+   * answer within the timeout. Null means loss, never "very slow".
+   */
+  measureRtt(peerId: string, timeoutMs?: number): Promise<number | null>;
 }
 
 export interface VoiceEvents {
@@ -105,6 +131,10 @@ export interface VoiceTransport {
   setOutputVolume(volume: number): void;
   getOutputVolume(): number;
 
+  // intentional local sounds mixed after microphone processing
+  playCallAudio(blob: Blob, options?: { volume?: number }): Promise<{ id: string; durationMs: number }>;
+  stopCallAudio(id?: string): void;
+
   // events
   on<K extends keyof VoiceEvents>(event: K, handler: VoiceEvents[K]): void;
   off<K extends keyof VoiceEvents>(event: K, handler: VoiceEvents[K]): void;
@@ -132,9 +162,20 @@ export interface VideoEvents {
     track: MediaStreamTrack,
     source: VideoSource
   ) => void;
-  trackRemoved: (peerId: string, source: VideoSource) => void;
+  /** `kind` distinguishes which underlying track ended - a peer can lose
+   *  camera or screen independently while the other keeps flowing. */
+  trackRemoved: (
+    peerId: string,
+    source: VideoSource,
+    kind: "audio" | "video"
+  ) => void;
   peerJoined: (peerId: string) => void;
   peerLeft: (peerId: string) => void;
+  /** Fired once when getStats sees 2 consecutive stalled samples on a
+   *  consumer, right before it is closed and re-consumed. A later
+   *  trackAdded for the same peer/source is the recovery signal - there is
+   *  no separate "recovered" event. */
+  trackStalled: (peerId: string, source: VideoSource) => void;
   /** Fired when a remote peer starts a screen-share transmission (opt-in: not auto-consumed). */
   transmissionAvailable: (peerId: string, producerId: string) => void;
   /** Fired when a remote peer's transmission ends (they stopped sharing or left). */
@@ -173,10 +214,6 @@ export interface VideoTransport {
   /** If `stream` is provided, publish it directly (avoids a second getDisplayMedia call). */
   startScreenShare(stream?: MediaStream): Promise<void>;
   stopScreenShare(): void;
-  pauseVideo(source: VideoSource): void;
-  resumeVideo(source: VideoSource): void;
-  isPaused(source: VideoSource): boolean;
-  isPublishing(source: VideoSource): boolean;
 
   /** Start consuming a pending transmission from a remote peer. */
   watchTransmission(peerId: string, producerId: string): Promise<void>;
@@ -185,11 +222,12 @@ export interface VideoTransport {
   /** Returns all pending (not yet watched) transmissions: peerId → producerId. */
   getPendingTransmissions(): Map<string, string>;
 
-  getAudioTrack(peerId: string): MediaStreamTrack | null;
-
   on<K extends keyof VideoEvents>(event: K, handler: VideoEvents[K]): void;
   off<K extends keyof VideoEvents>(event: K, handler: VideoEvents[K]): void;
   activePeers(): string[];
+  /** How many OTHER peers the SFU room held at last join - a primitive for
+   *  cross-checking SFU room membership against the libp2p call roster. */
+  roomPeerCount(): number;
 }
 
 export type FileTransferStatus =
@@ -204,6 +242,14 @@ export interface FileDescriptor {
   filename: string;
   mimeType: string;
   size: number;
+  /**
+   * Intrinsic pixel size, when the sender could measure it. Optional because
+   * an older sender does not send it and because not everything is an image;
+   * both cases render the way they always did. Untrusted on arrival - see
+   * isSaneDimension.
+   */
+  width?: number;
+  height?: number;
 }
 
 export interface FileTransferSnapshot extends FileDescriptor {

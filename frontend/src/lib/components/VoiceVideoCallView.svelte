@@ -1,10 +1,10 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
   import { Tip } from "$lib/components/ui/tooltip";
   import { formatReactorNames } from "$lib/reaction-names";
   import GifImage from "./GifImage.svelte";
   import { RELAY_TIP } from "$lib/copy";
-  import { openDmConversation } from "$lib/transport/dm.svelte";
+  import { applyVoiceLinkStatus } from "$lib/voice-link-status";
+  import { openDmPanel } from "$lib/transport/dm.svelte";
   import {
     getVoicePeerVolume,
     setVoicePeerVolume,
@@ -31,11 +31,16 @@
   import {
     joinCall,
     leaveCall,
-    startScreenShare,
+    toggleScreenShare,
     stopScreenShare,
     toggleCamera,
     toggleMute,
   } from "$lib/transport/call.svelte";
+  import { speakers } from "$lib/speakers.svelte";
+  import { callFocus, autofocusEffect } from "$lib/call-focus.svelte";
+  import { callPipPanel } from "$lib/call-pip.svelte";
+  import { enterBrowserPip, exitBrowserPip } from "$lib/call-spotlight.svelte";
+  import { spotlightStore } from "$lib/call-spotlight.svelte";
 
   import {
     Eye,
@@ -57,17 +62,30 @@
     Workflow,
     Puzzle,
     X as XIcon,
+    Tv2,
   } from "@lucide/svelte";
-  import { Check, MessageSquare, MonitorIcon, SlidersHorizontal, Users as UsersIcon, UserX } from "@lucide/svelte";
+  import { Check, Columns2, MessageSquare, MonitorIcon, Rows2, SlidersHorizontal, Users as UsersIcon, UserX } from "@lucide/svelte";
 import { profileStore, loadProfile } from "$lib/profile.svelte";
-import { displayPrefs } from "$lib/display-prefs.svelte";
+import { displayPrefs, setCallChatBeside, setCallPip } from "$lib/display-prefs.svelte";
 import { cn } from "$lib/utils";
 import { callTilesState, refreshCallTiles } from "$lib/plugins/call-tiles.svelte";
 import { getManifest } from "$lib/plugins/registry";
 import { onCardStateChange } from "$lib/plugins/state.svelte";
 import PluginCallTileView from "./PluginCallTileView.svelte";
 import PluginIcon from "$lib/plugins/PluginIcon.svelte";
+import {
+  ambientStyle,
+  glowFor,
+  primeGlow,
+  rimStyle,
+} from "$lib/avatar-glow.svelte";
   import { Slider } from "./ui/slider";
+
+  interface Props {
+    /** The call stage is a column beside the chat, not a band above it. */
+    beside?: boolean;
+  }
+  let { beside = false }: Props = $props();
 
   $effect(() => {
     loadProfile();
@@ -86,6 +104,10 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     deafened?: boolean;
     /** Announced in the call but their voice link is not up yet. */
     connecting?: boolean;
+    /** getStats saw the consumer stop advancing - a track object exists
+     *  but proves nothing about whether RTP is still arriving
+     *  (sfu-audit finding 14). */
+    stalled?: boolean;
     /** True when this is a screen-share transmission tile that hasn't been joined yet. */
     isPending?: boolean;
     /** The SFU producerId - only set on pending transmission tiles. */
@@ -208,7 +230,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   function openViewMenu(e: MouseEvent): void {
     e.preventDefault();
     peerMenu = null;
-    viewMenu = clampMenu(e, 224, 248);
+    viewMenu = clampMenu(e, 224, 320);
   }
 
   function closeMenus(): void {
@@ -221,202 +243,39 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     if (peerMenu) setVoicePeerVolume(peerMenu.peerId, sliderToGain(value));
   }
 
+  /**
+   * The floating panel, not the chat pane. Pointing the pane at the DM unmounts
+   * this call stage - the stage is gated on the pane showing the call's room -
+   * and the pane filters messages by the room the VIEW is on, so the DM
+   * rendered as an empty conversation you could send into but never see.
+   */
   async function dmFromPeerMenu(): Promise<void> {
     const peerId = peerMenu?.peerId;
     closeMenus();
-    if (peerId) await openDmConversation(peerId);
+    if (peerId) await openDmPanel(peerId);
   }
 
-  let speakingPeers = $state(new Set<string>());
-  const analysers = new Map<
-    string,
-    {
-      analyser: AnalyserNode;
-      source: MediaStreamAudioSourceNode;
-      track: MediaStreamTrack;
-    }
-  >();
-
-  // One context for everyone. A context per peer meant every track event closed
-  // and reopened all of them, and browsers cap how many can exist at once - once
-  // that cap was hit the constructor threw and the ring never came back.
-  let sharedCtx: AudioContext | null = null;
-
-  function speakerCtx(): AudioContext {
-    if (!sharedCtx || sharedCtx.state === "closed") {
-      sharedCtx = new AudioContext();
-    }
-    // A context created without a user gesture, or suspended while the tab sat
-    // in the background, reports silence until it is resumed - which is the
-    // other way the ring used to stop for good.
-    if (sharedCtx.state === "suspended") sharedCtx.resume().catch(() => {});
-    return sharedCtx;
-  }
-
-  function startSpeakerDetection(peerId: string, track: MediaStreamTrack) {
-    const existing = analysers.get(peerId);
-    if (existing) {
-      // Same track and still live: nothing to do. A track that has ended (the
-      // mic was restarted underneath us) has to be rewired, not kept.
-      if (existing.track === track && track.readyState === "live") return;
-      stopSpeakerDetection(peerId);
-    }
-    if (track.readyState !== "live") return;
-    try {
-      const ctx = speakerCtx();
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 512;
-      const source = ctx.createMediaStreamSource(new MediaStream([track]));
-      source.connect(analyser);
-      analysers.set(peerId, { analyser, source, track });
-    } catch {
-      // ignore
-    }
-  }
-
-  function stopSpeakerDetection(peerId: string) {
-    const entry = analysers.get(peerId);
-    if (!entry) return;
-    entry.source.disconnect();
-    analysers.delete(peerId);
-    lastLoudAt.delete(peerId);
-    speakingPeers = new Set([...speakingPeers].filter((p) => p !== peerId));
-  }
-
-  let rafId: number | null = null;
-
-  // Speech has gaps between syllables, so a bare per-frame threshold makes the
-  // ring strobe. Hold it on briefly after the last loud frame, and use a lower
-  // threshold to stay on than to switch on.
-  const SPEAKING_HOLD_MS = 500;
-  // Average byte-frequency amplitude (0-255). Tuned DOWN by live testing:
-  // at 5/2 the ring still missed quiet talkers and soft consonants, reading
-  // as "not speaking" mid-sentence. Noise suppression upstream (DTLN) keeps
-  // the floor near zero, so a low trigger is safe.
-  const SPEAKING_ON = 3;
-  const SPEAKING_OFF = 1;
-  const lastLoudAt = new Map<string, number>();
-
-  // Peers whose voice ICE actually completed - a roster tile without a track
-  // AND without this is still connecting, and must not render as present.
+  // Peers whose voice ICE actually completed - a roster tile without a
+  // track AND without this is still connecting, and must not render as
+  // present. Insert and delete key are the SAME reducer, so they can never
+  // drift apart the way an insert-by-full-id/delete-by-short-id split once
+  // did (voice-audit finding 8) - a torn-down peer always leaves this set.
   let iceConnectedPeers = $state(new Set<string>());
   $effect(() => {
     const onStatus = (st: { type: string; peerId?: string }) => {
-      if (st.type === "voice-ice-connected" && st.peerId) {
-        iceConnectedPeers = new Set([...iceConnectedPeers, st.peerId]);
-      }
-      if (
-        (st.type === "voice-peer-left" ||
-          st.type === "voice-connection-failed") &&
-        st.peerId
-      ) {
-        const next = new Set(iceConnectedPeers);
-        next.delete(st.peerId);
-        iceConnectedPeers = next;
-      }
+      iceConnectedPeers = new Set(applyVoiceLinkStatus(iceConnectedPeers, st));
     };
     _transport?.on("status", onStatus);
     return () => _transport?.off("status", onStatus);
   });
 
-  // Hoisted: allocating a fresh buffer per animation frame churned the GC.
-  const speakerBuf = new Uint8Array(512);
-  // Analysing at 60fps buys nothing over 10Hz for a 500ms-hold ring; the rAF
-  // loop stays (it pauses in hidden tabs) but the FFT reads are throttled.
-  const SPEAKER_POLL_MS = 100;
-  let nextSpeakerPollAt = 0;
-
-  function pollSpeakers() {
-    const pollNow = performance.now();
-    if (pollNow < nextSpeakerPollAt) {
-      rafId = requestAnimationFrame(pollSpeakers);
-      return;
-    }
-    nextSpeakerPollAt = pollNow + SPEAKER_POLL_MS;
-    if (sharedCtx?.state === "suspended") sharedCtx.resume().catch(() => {});
-    const buf = speakerBuf;
-    const now = performance.now();
-    const next = new Set<string>();
-
-    for (const [peerId, { analyser }] of analysers) {
-      analyser.getByteFrequencyData(buf);
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++) sum += buf[i];
-      const avg = sum / buf.length;
-      const threshold = speakingPeers.has(peerId) ? SPEAKING_OFF : SPEAKING_ON;
-      if (avg > threshold) lastLoudAt.set(peerId, now);
-      if (now - (lastLoudAt.get(peerId) ?? -Infinity) < SPEAKING_HOLD_MS) {
-        next.add(peerId);
-      }
-    }
-
-    // This runs every frame: only publish when the set actually changed, or
-    // every consumer re-renders 60 times a second for nothing.
-    const changed =
-      next.size !== speakingPeers.size ||
-      [...next].some((peerId) => !speakingPeers.has(peerId));
-    if (changed) speakingPeers = next;
-
-    rafId = requestAnimationFrame(pollSpeakers);
-  }
-
-  $effect(() => {
-    // Track which peers should have analysers
-    const desiredPeers = new Set<string>();
-
-    // Add remote peers with audio
-    for (const [peerId, p] of participants) {
-      if (p.audioTrack) {
-        desiredPeers.add(peerId);
-      }
-    }
-
-    // Add self if not muted
-    if (!muted && localMicStream) {
-      const track = localMicStream.getAudioTracks()[0];
-      if (track) {
-        desiredPeers.add(selfId());
-      }
-    }
-
-    // Create/update analysers for desired peers
-    for (const peerId of desiredPeers) {
-      const track = peerId === selfId()
-        ? localMicStream?.getAudioTracks()[0]
-        : participants.get(peerId)?.audioTrack;
-      if (track) {
-        startSpeakerDetection(peerId, track);
-      }
-    }
-
-    // Remove analysers for peers no longer desired
-    for (const peerId of [...analysers.keys()]) {
-      if (!desiredPeers.has(peerId)) {
-        stopSpeakerDetection(peerId);
-      }
-    }
-
-    // Start RAF loop if needed
-    if (!rafId && desiredPeers.size > 0) {
-      rafId = requestAnimationFrame(pollSpeakers);
-    }
-    if (rafId && desiredPeers.size === 0) {
-      cancelAnimationFrame(rafId);
-      rafId = null;
-    }
-    // No teardown on re-run: this effect re-runs on every track event, and
-    // tearing every analyser down each time is what left peers without one.
-  });
-
-  onDestroy(() => {
-    if (rafId) cancelAnimationFrame(rafId);
-    rafId = null;
-    for (const peerId of [...analysers.keys()]) {
-      stopSpeakerDetection(peerId);
-    }
-    sharedCtx?.close().catch(() => {});
-    sharedCtx = null;
-  });
+  // Speaker detection is driven from AppView, NOT here. A $effect in this
+  // component dies with it, and this component unmounts the moment the user
+  // navigates away from the call room - which is exactly when the floating
+  // panel needs the speaker data. Driving it here also meant a call ended from
+  // the panel never tore the analysers down, leaking the AudioContext and the
+  // poll loop for the rest of the session. This component only READS
+  // speakers.speaking for its rings.
 
   // ── Video / Audio actions ─────────────────────────────────────────────────
 
@@ -495,6 +354,8 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
         videoTrack: null,
         screenTrack: null,
         screenAudioTrack: null,
+        videoStalled: false,
+        screenStalled: false,
       };
       const label = getPeerLabel(peerId);
       const avatarUrl = getPeerAvatar(peerId);
@@ -512,6 +373,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
         deafened: remoteCallState?.deafened,
         connecting:
           !p.audioTrack && !p.videoTrack && !iceConnectedPeers.has(peerId),
+        stalled: p.videoStalled,
       });
     }
     if (localScreenTrack) {
@@ -537,6 +399,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
           kind: "screen",
           videoTrack: p.screenTrack,
           peerId: p.peerId,
+          stalled: p.screenStalled,
         });
       }
     }
@@ -709,6 +572,27 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     };
   });
 
+  /**
+   * Is the cursor over this plugin tile?
+   *
+   * Geometry, not :hover, for the same reason pluginBadgeHidden is: the
+   * plugin's content lives in a floating layer above the placeholder, and the
+   * controls inside it re-enable pointer events. The moment the cursor
+   * crosses one of those, the placeholder stops being hovered and any
+   * group-hover chrome blinks out - right when the user is reaching for it.
+   */
+  function pluginTileHovered(id: string): boolean {
+    const rect = pluginRects[id];
+    const m = panelMouse;
+    if (!rect || !m) return false;
+    return (
+      m.x >= rect.x &&
+      m.x <= rect.x + rect.w &&
+      m.y >= rect.y &&
+      m.y <= rect.y + rect.h
+    );
+  }
+
   function pluginBadgeHidden(id: string): boolean {
     const rect = pluginRects[id];
     const m = panelMouse;
@@ -730,12 +614,6 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   });
   let cardStateTickForPlugins = $state(0);
   $effect(() => onCardStateChange(() => (cardStateTickForPlugins += 1)));
-
-  const hasActiveVideo = $derived(
-    localVideoTrack !== null ||
-      localScreenTrack !== null ||
-      [...participants.values()].some((p) => p.videoTrack || p.screenTrack)
-  );
 
   const isWatchingTransmission = $derived(watchingTransmissionPeerId !== null);
 
@@ -792,12 +670,14 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     return kept.length ? kept : tiles;
   });
 
+  // Container queries, not viewport ones: beside the chat the stage is a
+  // narrow column inside a wide window.
   const gridCols = $derived.by(() => {
     const n = visibleTiles.length;
     if (n <= 1) return "grid-cols-1";
-    if (n <= 3) return "grid-cols-1 sm:grid-cols-2";
-    if (n <= 7) return "grid-cols-2 sm:grid-cols-3";
-    return "grid-cols-2 sm:grid-cols-4";
+    if (n <= 3) return "grid-cols-1 @md:grid-cols-2";
+    if (n <= 7) return "grid-cols-1 @xs:grid-cols-2 @xl:grid-cols-3";
+    return "grid-cols-1 @xs:grid-cols-2 @xl:grid-cols-4";
   });
 
   const rowClass = $derived.by(() => {
@@ -811,34 +691,47 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     return rows <= 1 ? "h-[35vh]" : "h-[45vh]";
   });
 
+  // rowClass is viewport-height based and only means anything stacked. Beside
+  // the chat the panel just fills its row.
+  const panelSizeClass = $derived.by(() => {
+    if (isFullscreen) return "h-screen";
+    if (beside) return "min-h-0 flex-1";
+    return `shrink-0 border-b border-border ${rowClass}`;
+  });
+
   // ── Focus ─────────────────────────────────────────────────────────────────
 
-  let focusedTileId = $state<string | null>(null);
+  // Pin state is in callFocus store so it survives navigation away from the
+  // call room. The stage reads callFocus.pinnedTileId to determine what to focus.
   const focusedTile = $derived(
-    focusedTileId
-      ? (visibleTiles.find((t) => t.id === focusedTileId) ?? null)
+    callFocus.pinnedTileId
+      ? (visibleTiles.find((t) => t.id === callFocus.pinnedTileId) ?? null)
       : null
   );
-  // A focused screen/transmission is being WATCHED, not glanced at: the
-  // panel grows (rowClass) and the controls go immersive like fullscreen
-  // (dockedControls).
-  const watchingFocused = $derived(
-    !!focusedTile &&
-      (focusedTile.kind === "screen" || focusedTile.kind === "transmission")
-  );
+  // A focused tile is being WATCHED, not glanced at - but only where the
+  // focus visibly changes the layout. Stacked above the chat, the panel
+  // grows (rowClass) and the controls go immersive like fullscreen
+  // (dockedControls). BESIDE the chat the panel is already as big as it
+  // gets: a pin there rearranges tiles but grows nothing, and controls that
+  // vanished on a click that changed so little read as "watching a live
+  // undocked my controls" - so beside stays docked, and fullscreen is the
+  // immersive mode there. Cameras count like shares and app tiles: a
+  // focused face is watched the same way a focused stream is.
+  const watchingFocused = $derived(!!focusedTile && !beside);
   const showThumbnails = $derived(
     focusedTile ? focusedTile.kind !== "screen" : false
   );
   const thumbnailTiles = $derived(
     focusedTile && showThumbnails
-      ? visibleTiles.filter((t) => t.id !== focusedTileId)
+      ? visibleTiles.filter((t) => t.id !== callFocus.pinnedTileId)
       : []
   );
 
+  // Clear the pin if the pinned tile disappears (peer leaves, share ends).
+  // This effect survives navigation away from the call room because the pin
+  // is in the callFocus store, not this component.
   $effect(() => {
-    if (focusedTileId && !tiles.find((t) => t.id === focusedTileId)) {
-      focusedTileId = null;
-    }
+    autofocusEffect(tiles.map((t) => t.id));
   });
 
   // ── Controls auto-hide ────────────────────────────────────────────────────
@@ -854,11 +747,12 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   let transmissionVolumeSettleTimer: ReturnType<typeof setTimeout> | null =
     null;
 
-  // Docked only when there is nothing to watch - pure audio call
-  // Windowed: the controls dock and stay put. Fullscreen AND the focused
-  // tall-panel view are the immersive modes - there the controls (and the
-  // fullscreen button, and plugin tile chrome, which all key off this)
-  // fade after the idle timeout and return on mouse movement.
+  // Docked (visible, in reserved space below the tiles) unless immersive:
+  // fullscreen, or the focused tall-panel view - there the controls (and
+  // the fullscreen button, and plugin tile chrome, which all key off this)
+  // fade after the idle timeout and return on mouse movement. Merely
+  // watching a live in the grid, or focusing one beside the chat, keeps
+  // the controls docked - see watchingFocused.
   const dockedControls = $derived(!isFullscreen && !watchingFocused);
 
   $effect(() => {
@@ -995,7 +889,28 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     if (!panelEl) return;
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     else panelEl.requestFullscreen().catch(() => {});
-  } // ── Visibility conditions ─────────────────────────────────────────────────
+  }
+
+  async function toggleBrowserPiP(): Promise<void> {
+    if (callPipPanel.browserPip) await exitBrowserPip();
+    else await enterBrowserPip(() => {});
+  }
+
+  // ── Visibility conditions ─────────────────────────────────────────────────
+
+  // Every avatar currently on screen gets its average colour resolved once.
+  // Priming from an effect rather than from the template on demand: the
+  // template runs during render, and seeding a cache there is a state write
+  // mid-render.
+  $effect(() => {
+    // Off means no decode at all, not a decode whose result is thrown away.
+    if (!displayPrefs.avatarTint) return;
+    for (const t of tiles) if (t.avatarUrl) primeGlow(t.avatarUrl);
+    for (const peerId of callPeerIds) {
+      const avatar = getPeerAvatar(peerId);
+      if (avatar) primeGlow(avatar);
+    }
+  });
 
   const nobodyInCall = $derived(callPeerIds.size === 0 && !inCall);
   const othersInCallNotUs = $derived(callPeerIds.size > 0 && !inCall);
@@ -1020,6 +935,8 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
 )}
   {@const hasVideo = tile.videoTrack !== null}
   {@const isPendingTx = tile.kind === "transmission" && tile.isPending}
+  {@const isWatchedTx =
+    tile.kind === "transmission" && watchingTransmissionPeerId === tile.peerId}
   {@const tileColor = getPeerColor(tile.peerId)}
   {#if tile.kind === "plugin" && joinedPluginTiles.has(tile.id)}
     <!-- A DIV, not the button every other tile is: the plugin renders its
@@ -1050,6 +967,34 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     >
       <!-- Content lives in the persistent layer; this is only the anchor
            the layer follows, plus the chrome painted above it. -->
+      <!-- "Leave", not "Stop watching": the same word for every plugin, and
+           the mirror of the "Join {tile.label}" affordance this tile replaced.
+           A plugin is not always something you watch - a party is something
+           you are in. Hidden until the cursor is on the tile so it does not
+           sit over the plugin's own content the whole call - except on a
+           touch screen, where there is no cursor to reveal it with and a
+           hidden control is simply an unreachable one. -->
+      <Tip text="Leave {tile.label}">
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            onclick={(event) => {
+              event.stopPropagation();
+              joinedPluginTiles = new Set(
+                [...joinedPluginTiles].filter((id) => id !== tile.id)
+              );
+            }}
+            aria-label="Leave {tile.label}"
+            class="absolute left-1.5 top-1.5 z-30 flex size-8 items-center justify-center rounded-lg bg-red-500/30 text-red-300 ring-1 ring-red-500/60 transition-opacity hover:bg-red-500/45 focus-visible:pointer-events-auto focus-visible:opacity-100 {isSmallScreen ||
+            pluginTileHovered(tile.id)
+              ? ''
+              : 'pointer-events-none opacity-0'}"
+          >
+            <Radio class="size-4" />
+          </button>
+        {/snippet}
+      </Tip>
       <div
         class="absolute bottom-1.5 left-1.5 z-30 flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 pointer-events-none transition-opacity {pluginBadgeHidden(
           tile.id
@@ -1077,56 +1022,16 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
         </Tip>
       {/if}
     </div>
-  {:else}
-  <button
-    type="button"
-    oncontextmenu={(e) => openPeerMenu(e, tile)}
-    class="group relative flex items-center justify-center overflow-hidden rounded-lg bg-muted/30 cursor-pointer transition-shadow duration-200
-      {tile.connecting ? 'connecting-wave' : ''}
-      {isFocused ? 'w-full h-full' : ''}
-      {compact ? 'aspect-video' : ''}
-      {isSpeaking
-      ? 'ring-2 ring-primary shadow-[0_0_8px_rgba(0,255,136,0.4)]'
-      : ''}
-      {isPendingTx ? 'ring-1 ring-primary/40 hover:ring-primary/80' : ''}"
-    onclick={() => {
-      if (tile.kind === "plugin") {
-        // Opt-in, like screen shares: nothing plays until you join.
-        joinedPluginTiles = new Set([...joinedPluginTiles, tile.id]);
-        return;
-      }
-      if (isPendingTx) {
-        // Join this transmission (opt-in)
-        if (tile.producerId) {
-          watchTransmission(tile.peerId, tile.producerId);
-        }
-        return;
-      }
-      if (isOnlyOne) return;
-      if (isFocused) onUnfocus();
-      else onFocus();
-    }}
-    aria-label={tile.kind === "plugin"
-      ? `Join ${tile.label}`
-      : isPendingTx
-        ? `Watch ${tile.label}'s screen`
-        : isFocused
-          ? "Minimize tile"
-          : `Focus ${tile.label}`}
-  >
-    {#if hasVideo}
-      <video
-        autoplay
-        playsinline
-        muted
-        class="h-full w-full object-contain {tile.isLocal &&
-        tile.kind === 'camera'
-          ? '-scale-x-100'
-          : ''}"
-        use:videoAction={tile.videoTrack!}
-      ></video>
-    {:else if tile.kind === "plugin"}
-      <!-- Unjoined plugin tile: icon plus an explicit join affordance. -->
+  {:else if tile.kind === "plugin"}
+    <!-- Not joined yet. The tile itself is inert - only the join button takes
+         a click. As one big button, any stray click anywhere in the tile
+         opted you into loading a plugin's content, which is the one thing
+         opt-in exists to prevent. -->
+    <div
+      class="relative flex items-center justify-center overflow-hidden rounded-lg bg-muted/30 {isFocused
+        ? 'w-full h-full'
+        : ''} {compact ? 'aspect-video' : ''}"
+    >
       {#if tile.pluginViewers?.length}
         <Tip text={(tile.pluginViewers ?? []).join(", ")}>
           {#snippet children(props)}
@@ -1140,35 +1045,103 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
           {/snippet}
         </Tip>
       {/if}
-      <div
-        class="pointer-events-none absolute inset-0 grid place-items-center bg-muted/30"
-      >
-        <div class="flex flex-col items-center gap-2">
-          <PluginIcon
-            icon={getManifest(tile.pluginId ?? "")?.icon ?? "🔌"}
-            class="size-8 text-primary"
-          />
-          <div
-            class="rounded-full border border-border bg-background/95 px-3 py-1.5 text-xs font-mono text-foreground shadow-sm transition-all group-hover:border-primary/50 group-hover:shadow-md"
-          >
-            Join {tile.label}
-          </div>
-        </div>
+      <div class="flex flex-col items-center gap-2">
+        <PluginIcon
+          icon={getManifest(tile.pluginId ?? "")?.icon ?? "lucide:unplug"}
+          class="size-8 text-primary"
+        />
+        <button
+          type="button"
+          onclick={() => {
+            joinedPluginTiles = new Set([...joinedPluginTiles, tile.id]);
+          }}
+          class="cursor-pointer rounded-full border border-border bg-background/95 px-3 py-1.5 text-xs font-mono text-foreground shadow-sm transition-all hover:border-primary/50 hover:shadow-md"
+        >
+          Join {tile.label}
+        </button>
       </div>
+    </div>
+  {:else}
+  <!-- A wrapper so the "stop watching" control can sit BESIDE the tile rather
+       than inside it. A button nested in a button is invalid HTML, which is
+       what pushed this element to div role="button" - but that trades away
+       focus handling, keyboard activation and assistive-technology semantics
+       that a real button gives for free, on every tile in the call, to serve
+       one overlay. The layout classes live on the wrapper; the button fills
+       it. -->
+  <div
+    class="relative {isFocused ? 'w-full h-full' : ''} {compact
+      ? 'aspect-video'
+      : ''}"
+  >
+  <button
+    type="button"
+    oncontextmenu={(e) => openPeerMenu(e, tile)}
+    class="group relative flex h-full w-full items-center justify-center overflow-hidden rounded-lg bg-muted/30 cursor-pointer transition-shadow duration-200
+      {tile.connecting ? 'connecting-wave' : ''}
+      {isSpeaking
+      ? 'ring-2 ring-primary shadow-[0_0_8px_rgba(0,255,136,0.4)]'
+      : ''}
+      {isPendingTx ? 'ring-1 ring-primary/40 hover:ring-primary/80' : ''}"
+    onclick={() => {
+      if (isPendingTx) {
+        // Join this transmission (opt-in)
+        if (tile.producerId) {
+          watchTransmission(tile.peerId, tile.producerId);
+        }
+        return;
+      }
+      if (isOnlyOne) return;
+      if (isFocused) onUnfocus();
+      else onFocus();
+    }}
+    aria-label={isPendingTx
+      ? `Watch ${tile.label}'s screen`
+      : isFocused
+        ? "Minimize tile"
+        : `Focus ${tile.label}`}
+  >
+    {#if hasVideo}
+      <video
+        autoplay
+        playsinline
+        muted
+        class="h-full w-full object-contain {tile.isLocal &&
+        tile.kind === 'camera'
+          ? '-scale-x-100'
+          : ''}"
+        use:videoAction={tile.videoTrack!}
+      ></video>
     {:else if !isPendingTx}
+      {@const glow = displayPrefs.avatarTint ? glowFor(tile.avatarUrl) : null}
+      {#if glow}
+        <!-- The tile lit by the person in it. Both layers sit before the
+             avatar in the DOM so the avatar paints over them. -->
+        <div
+          class="pointer-events-none absolute inset-0 transition-opacity duration-500"
+          style={ambientStyle(glow)}
+        ></div>
+        <!-- Grain, and not only for the look: a wide radial gradient over a
+             near-black tile bands into visible rings on an 8-bit display, and
+             noise is what dithers it away. -->
+        <div class="tile-grain pointer-events-none absolute inset-0"></div>
+      {/if}
       <div
         class="relative flex items-center justify-center rounded-full {tile.isLocal
           ? 'bg-primary/20 text-primary'
-          : 'bg-secondary text-secondary-foreground'} font-semibold overflow-hidden font-mono transition-shadow duration-200
-        {compact ? 'size-8 text-sm' : 'size-16 text-2xl'}"
-        style={tileColor ? `color: ${tileColor}` : ""}
+          : 'bg-secondary text-secondary-foreground'} font-semibold overflow-hidden font-mono transition-[filter] duration-300
+        {compact ? 'size-[2.66rem] text-sm' : 'size-[5.32rem] text-2xl'}"
+        style="{tileColor ? `color: ${tileColor};` : ''}{rimStyle(
+          glow,
+          compact ? 0.5 : 1
+        )}"
       >
         {#if tile.avatarUrl}
           <GifImage
             src={tile.avatarUrl}
             alt={tile.label}
             class="size-full object-cover"
-            animate={speakingPeers.has(tile.peerId)}
+            animate={speakers.speaking.has(tile.peerId)}
           />
         {:else}
           {tile.label.charAt(0).toUpperCase()}
@@ -1208,8 +1181,28 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
       </div>
     {/if}
 
+    <!-- Stalled overlay: getStats saw the consumer stop advancing. A track
+         object is proof a consumer exists, not that RTP still arrives
+         (sfu-audit finding 14) - this is the honest signal instead. -->
+    {#if tile.stalled && hasVideo}
+      <div
+        class="pointer-events-none absolute inset-0 grid place-items-center bg-background/50"
+      >
+        <div
+          class="flex items-center gap-1.5 rounded-full border border-border bg-background/95 px-3 py-1.5 text-xs font-mono text-foreground shadow-sm"
+        >
+          {#if tile.kind === "screen"}
+            <MonitorOff class="size-3.5" />
+          {:else}
+            <CameraOff class="size-3.5" />
+          {/if}
+          Frozen - reconnecting
+        </div>
+      </div>
+    {/if}
+
     <!-- Name badge -->
-    {#if !isPendingTx && tile.kind !== "plugin"}
+    {#if !isPendingTx}
       <div
         class="absolute bottom-1.5 left-1.5 flex items-center gap-1 rounded bg-black/60 px-1.5 py-0.5 pointer-events-none"
       >
@@ -1232,6 +1225,8 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
               ? `${tile.label} (You)`
               : tile.label}
         </span>
+        <!-- Relayed badge on call tiles: always shown, not gated on showConnectionInfo.
+             That setting controls only the floating panel on the right. -->
         {#if !tile.isLocal && isRelayed(tile.peerId)}
           <!-- pointer-events-auto: the badge itself ignores the pointer so it
                does not swallow clicks on the tile, but the tooltip needs the
@@ -1252,6 +1247,19 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
       </div>
     {/if}
   </button>
+    {#if isWatchedTx}
+      <!-- A SIBLING of the tile button, not a child: nesting it was what made
+           the tile stop being a button in the first place. -->
+      <button
+        type="button"
+        onclick={stopWatchingTransmission}
+        aria-label="Stop watching"
+        class="absolute top-1.5 left-1.5 z-20 flex size-8 items-center justify-center rounded-lg bg-red-500/30 text-red-300 ring-1 ring-red-500/60 hover:bg-red-500/45"
+      >
+        <Radio class="size-4" />
+      </button>
+    {/if}
+  </div>
   {/if}
 {/snippet}
 
@@ -1259,10 +1267,13 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   <!-- render nothing -->
 {:else if othersInCallNotUs}
   <div
-    class="flex flex-col border-b border-border shrink-0 h-[12vh] sm:h-[16vh] pb-14 relative bg-background"
+    class="flex flex-col relative pb-14 bg-background
+      {beside
+      ? 'min-h-0 flex-1'
+      : 'h-[12vh] sm:h-[16vh] shrink-0 border-b border-border'}"
   >
     <div class="flex-1 flex items-center justify-center">
-      <div class="flex items-center gap-1">
+      <div class="flex flex-wrap items-center justify-center gap-1">
         {#each [...callPeerIds] as peerId (peerId)}
           {@const label = getPeerLabel(peerId)}
           {@const avatar = getPeerAvatar(peerId)}
@@ -1272,7 +1283,8 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
             {#snippet children(props)}
           <div
             {...props}
-            class="relative flex size-16 sm:size-20 items-center justify-center rounded-full bg-secondary text-2xl font-semibold text-secondary-foreground ring-2 ring-background font-mono"
+            class="relative flex size-16 sm:size-20 items-center justify-center rounded-full bg-secondary text-2xl font-semibold text-secondary-foreground ring-2 ring-background font-mono transition-[filter] duration-300"
+            style={rimStyle(displayPrefs.avatarTint ? glowFor(avatar) : null)}
           >
             {#if avatar}
               <!-- The image clips to the circle, not the container: with
@@ -1282,11 +1294,14 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
                 src={avatar}
                 alt={label}
                 class="size-full rounded-full object-cover"
-                animate={speakingPeers.has(peerId)}
+                animate={speakers.speaking.has(peerId)}
               />
             {:else}
               {label.charAt(0).toUpperCase()}
             {/if}
+            <!-- Relayed badge on peer avatars in "others in call" view: always shown,
+                 not gated on showConnectionInfo. That setting controls only the floating
+                 panel on the right. -->
             {#if relayed}
               <Tip text={RELAY_TIP} side="top">
                 {#snippet children(props)}
@@ -1324,11 +1339,17 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
       <button
         type="button"
         onclick={joinCall}
-        disabled={transportState.connecting}
+        disabled={transportState.connecting || transportState.joiningCall}
+        aria-busy={transportState.joiningCall}
+        class:animate-pulse={transportState.joiningCall}
         class="group relative flex items-center gap-2 rounded-xl bg-primary px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/30 transition-all duration-200 hover:bg-primary/90 hover:scale-105 hover:shadow-primary/50 disabled:opacity-60 disabled:hover:scale-100"
       >
         <Phone class="size-4" />
-        {transportState.connecting ? "Connecting..." : "Join call"}
+        {transportState.joiningCall
+          ? "Joining..."
+          : transportState.connecting
+            ? "Connecting..."
+            : "Join call"}
       </button>
     </div>
   </div>
@@ -1338,9 +1359,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     role="group"
     aria-label="Call"
     oncontextmenu={openViewMenu}
-    class="flex flex-col border-b border-border relative shrink-0 bg-background
-      {isFullscreen ? 'h-screen' : rowClass}
-      {!isFullscreen && !hasActiveVideo ? 'pb-14' : ''}"
+    class="flex flex-col relative bg-background {panelSizeClass}"
   >
     <!-- Always-mounted remote audio elements -->
     {#each remoteAudio as a (a.id)}
@@ -1350,7 +1369,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
     {/each}
 
     <!-- Tile area -->
-    <div class="relative flex-1 min-h-0 overflow-hidden p-1.5">
+    <div class="@container relative flex-1 min-h-0 overflow-hidden p-1.5">
       {#if focusedTile}
         <div class="flex h-full gap-1.5">
           <div class="flex-1 min-w-0">
@@ -1358,26 +1377,26 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
               focusedTile,
               true,
               focusedTile.kind === "camera" &&
-                speakingPeers.has(focusedTile.peerId),
+                speakers.speaking.has(focusedTile.peerId),
               false,
               false,
               () => {},
-              () => (focusedTileId = null)
+              () => (callFocus.pinnedTileId = null)
             )}
           </div>
           {#if thumbnailTiles.length > 0}
             <div
-              class="flex flex-col gap-1 overflow-y-auto w-20 sm:w-28 shrink-0"
+              class="flex flex-col gap-1 overflow-y-auto w-20 @xl:w-28 shrink-0"
             >
               {#each thumbnailTiles as tile (tile.id)}
                 {@render callTile(
                   tile,
                   false,
-                  tile.kind === "camera" && speakingPeers.has(tile.peerId),
+                  tile.kind === "camera" && speakers.speaking.has(tile.peerId),
                   false,
                   true,
-                  () => (focusedTileId = tile.id),
-                  () => (focusedTileId = null)
+                  () => (callFocus.pinnedTileId = tile.id),
+                  () => (callFocus.pinnedTileId = null)
                 )}
               {/each}
             </div>
@@ -1389,11 +1408,11 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
             {@render callTile(
               tile,
               false,
-              tile.kind === "camera" && speakingPeers.has(tile.peerId),
+              tile.kind === "camera" && speakers.speaking.has(tile.peerId),
               tiles.length === 1,
               false,
-              () => (focusedTileId = tile.id),
-              () => (focusedTileId = null)
+              () => (callFocus.pinnedTileId = tile.id),
+              () => (callFocus.pinnedTileId = null)
             )}
           {/each}
         </div>
@@ -1422,16 +1441,32 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
       </div>
     {/each}
 
-    <!-- Call controls -->
+    <!-- Call controls. Docked = a REAL flex row below the tiles, not an
+         absolute bar floating over a padding band sized by guesswork: the
+         band (pb-14) was shorter than the bar, so the controls always bled
+         over the bottom tile row, and once the watching cluster (stop
+         button + volume) widened the bar it sat squarely on top of the
+         tiles - "undocked" in all but state. In flow, the tile area shrinks
+         around whatever height the bar actually has. The immersive modes
+         keep the floating overlay. -->
     <div
       role="group"
       aria-label="Call controls"
       class={cn(
-        "transition-all duration-300 absolute left-1/2 -translate-x-1/2 z-20",
-        isSmallScreen ? "bottom-2 w-[calc(100%-1rem)] max-w-120" : "bottom-4",
-        !dockedControls &&
-          !controlsVisible &&
-          "opacity-0 pointer-events-none translate-y-4"
+        "transition-all duration-300 z-20",
+        dockedControls
+          ? cn(
+              "relative shrink-0 py-2",
+              // Small screens' inner layout is a full-width 3-column grid;
+              // desktop is a shrink-to-fit cluster row that wants centering.
+              isSmallScreen ? "w-full px-2" : "flex justify-center"
+            )
+          : cn(
+              "absolute left-1/2 -translate-x-1/2",
+              isSmallScreen ? "bottom-2 w-[calc(100%-1rem)] max-w-120" : "bottom-4",
+              !controlsVisible &&
+                "opacity-0 pointer-events-none translate-y-4"
+            )
       )}
       onmouseenter={() => {
         if (isSmallScreen) return;
@@ -1476,6 +1511,9 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
                 {...props}
                 type="button"
                 onclick={toggleCamera}
+                disabled={transportState.cameraPending}
+                aria-busy={transportState.cameraPending}
+                class:animate-pulse={transportState.cameraPending}
                 aria-label={cameraOff ? "Turn on camera" : "Turn off camera"}
                 class="group relative flex h-8 w-8 items-center justify-center rounded-lg transition-all duration-200 shrink-0
                   {!cameraOff
@@ -1495,7 +1533,10 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
               <button
                 {...props}
                 type="button"
-                onclick={screenSharing ? stopScreenShare : startScreenShare}
+                onclick={toggleScreenShare}
+                disabled={transportState.screenSharePending}
+                aria-busy={transportState.screenSharePending}
+                class:animate-pulse={transportState.screenSharePending}
                 aria-label={screenSharing
                   ? "Stop screen share"
                   : "Share screen"}
@@ -1588,7 +1629,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
           </div>
         </div>
       {:else}
-        <div class="flex items-center gap-4">
+        <div class="flex max-w-full flex-wrap items-center justify-center gap-4">
           <div
             class={cn(
               "flex gap-2",
@@ -1622,6 +1663,9 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
               {...props}
               type="button"
               onclick={toggleCamera}
+              disabled={transportState.cameraPending}
+              aria-busy={transportState.cameraPending}
+              class:animate-pulse={transportState.cameraPending}
               aria-label={cameraOff ? "Turn on camera" : "Turn off camera"}
               class="group relative flex h-8 w-8 md:h-10 md:w-10 items-center justify-center rounded-lg transition-all duration-200 shrink-0
                 {!cameraOff
@@ -1642,7 +1686,10 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
             <button
               {...props}
               type="button"
-              onclick={screenSharing ? stopScreenShare : startScreenShare}
+              onclick={toggleScreenShare}
+              disabled={transportState.screenSharePending}
+              aria-busy={transportState.screenSharePending}
+              class:animate-pulse={transportState.screenSharePending}
               aria-label={screenSharing
                 ? "Stop screen share"
                 : "Share screen"}
@@ -1743,6 +1790,7 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
           "opacity-0 pointer-events-none"
       )}
     >
+    <!-- PiP and fullscreen buttons in the top corners -->
     <Tip text={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
       {#snippet children(props)}
     <!-- Worth showing only when it changes anything: some tile with
@@ -1775,6 +1823,23 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
         {/snippet}
       </Tip>
     {/if}
+
+    <!-- Browser PiP button. Clicking requests picture-in-picture on the panel's video element. -->
+    <Tip text={callPipPanel.browserPip ? "Exit picture-in-picture" : "Picture-in-picture"}>
+      {#snippet children(props)}
+        <button
+          {...props}
+          type="button"
+          onclick={toggleBrowserPiP}
+          aria-label={callPipPanel.browserPip ? "Exit picture-in-picture" : "Picture-in-picture"}
+          class="absolute top-3 right-12 sm:top-4 sm:right-12 flex h-8 w-8 sm:h-10 sm:w-10 items-center justify-center rounded-lg bg-zinc-900 text-zinc-300 transition-all duration-200 hover:bg-zinc-900 hover:scale-105 z-20 {callPipPanel.browserPip
+            ? 'text-primary'
+            : ''}"
+        >
+          <Tv2 class="size-4" />
+        </button>
+      {/snippet}
+    </Tip>
 
     <button
       {...props}
@@ -1856,6 +1921,40 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
             <Check class="size-3.5 shrink-0 text-primary" />
           {/if}
         </button>
+        <button
+          type="button"
+          role="menuitemcheckbox"
+          aria-checked={displayPrefs.callPip}
+          class="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted"
+          onclick={() => setCallPip(!displayPrefs.callPip)}
+        >
+          <Tv2 class="size-4 shrink-0" />
+          <span class="flex-1 truncate text-left">Picture-in-picture</span>
+          {#if displayPrefs.callPip}
+            <Check class="size-3.5 shrink-0 text-primary" />
+          {/if}
+        </button>
+        {#if !isSmallScreen}
+          <div class="my-1 border-t border-border"></div>
+          <p class="truncate px-3 pb-1 pt-0.5 text-xs text-muted-foreground">
+            Layout
+          </p>
+          {#each [{ beside: false, label: "Chat below", icon: Rows2 }, { beside: true, label: "Chat beside", icon: Columns2 }] as opt (opt.label)}
+            <button
+              type="button"
+              role="menuitemradio"
+              aria-checked={displayPrefs.callChatBeside === opt.beside}
+              class="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted"
+              onclick={() => setCallChatBeside(opt.beside)}
+            >
+              <opt.icon class="size-4 shrink-0" />
+              <span class="flex-1 truncate text-left">{opt.label}</span>
+              {#if displayPrefs.callChatBeside === opt.beside}
+                <Check class="size-3.5 shrink-0 text-primary" />
+              {/if}
+            </button>
+          {/each}
+        {/if}
       </div>
     {/if}
 
@@ -1920,6 +2019,15 @@ import PluginIcon from "$lib/plugins/PluginIcon.svelte";
 />
 
 <style>
+  /* Static film grain: one tiled SVG turbulence, desaturated so it is grain
+     and not confetti, overlaid so it darkens and lightens rather than washing
+     the tile grey. No animation - a call already has enough moving. */
+  .tile-grain {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    opacity: 0.16;
+    mix-blend-mode: overlay;
+  }
+
   /* Connecting tiles: a pronounced opacity wave - Tailwind's pulse was too
      subtle to read as "not here yet". */
   .connecting-wave {

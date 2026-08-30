@@ -101,6 +101,13 @@ export function humanize(
   content: string,
   resolveName: (did: string) => string
 ): string {
+  // Same reason as escapeHtml's coercion, one level up: `content` is a
+  // TypeScript claim about a JSON.parse result, so a peer can send a number or
+  // an object and it still signs and verifies. `.replace` on those throws, and
+  // callers run on paths where one throw loses the message - the DM receive
+  // path's only handler is .catch(console.error), so the throw skips the
+  // append and the DM stays invisible until reload.
+  if (typeof content !== "string") return "";
   // Match @[did] tokens
   // Allow any characters inside the brackets that are valid in a DID
   return content.replace(/@\[([^\[\]]+)\]/g, (match, did) => {
@@ -125,6 +132,10 @@ export function humanizeMentions(
   content: string,
   resolveName: (did: string) => string
 ): string {
+  // Non-string content is treated as empty here for the same reason as in
+  // humanize above: this is the notification-body path, and on DM receive a
+  // throw here skips the rest of the delivery bookkeeping.
+  if (typeof content !== "string") return "";
   // Match @[did] tokens
   return content.replace(/@\[([^\[\]]+)\]/g, (match, did) => {
     const name = resolveName(did);
@@ -154,6 +165,67 @@ export function mentionsMe(content: string, selfDids: string[]): boolean {
   return selfDids.some((did) => mentionedDids.has(did));
 }
 
+/** One offerable mention target. */
+export interface MentionCandidate {
+  did: string;
+  name: string;
+  /** Connected right now. Offline members are still offerable. */
+  online: boolean;
+}
+
+export interface MentionCandidateInput {
+  /** The room roster, as DIDs. Includes members who are not connected. */
+  roomUsers: readonly string[];
+  /** Live transport peer ids. */
+  peers: readonly string[];
+  /** Resolves a peer id or DID to its canonical DID. */
+  toDid: (id: string) => string;
+  /** Known display name for a DID or peer id, if any. */
+  nameOf: (id: string) => string | undefined;
+  /** Every id that means "me", so you are never offered yourself. */
+  selfIds: readonly string[];
+}
+
+/**
+ * Build the list of people a draft can mention.
+ *
+ * Sourced from the room ROSTER, not from live connections. Offering only
+ * connected peers meant an offline member never appeared, so their name-to-DID
+ * pair never reached the draft map, so `serialize` left the text as a literal
+ * `@Name` and `mentionsMe` was false forever: you could not mention somebody who
+ * was away, which is when a mention matters most.
+ *
+ * A member with no known name is dropped. The caller's fallback would be a DID
+ * fragment, and `@did:key:z6Mk` is not a mention anybody means to type.
+ */
+export function buildMentionCandidates(
+  input: MentionCandidateInput,
+): MentionCandidate[] {
+  const { roomUsers, peers, toDid, nameOf, selfIds } = input;
+  const mine = new Set(selfIds.filter(Boolean));
+  const onlineDids = new Set(peers.map(toDid));
+  const seen = new Set<string>();
+  const out: MentionCandidate[] = [];
+
+  for (const raw of [...roomUsers, ...peers]) {
+    if (!raw || mine.has(raw)) continue;
+    const did = toDid(raw);
+    if (!did || mine.has(did) || seen.has(did)) continue;
+    const name = nameOf(did) ?? nameOf(raw);
+    if (!name) continue;
+    seen.add(did);
+    out.push({ did, name, online: onlineDids.has(did) });
+  }
+
+  // People who can answer now come first, then alphabetical, so the list does
+  // not reshuffle under the cursor as connections come and go mid-type.
+  out.sort(
+    (a, b) =>
+      Number(b.online) - Number(a.online) || a.name.localeCompare(b.name),
+  );
+  return out;
+}
+
 /**
  * Escape special regex characters in a string.
  * Used to safely include user-provided names in regex patterns.
@@ -165,8 +237,12 @@ function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function escapeHtml(str: string): string {
-  return str
+function escapeHtml(str: unknown): string {
+  // Coerced, not assumed: display names come off the wire with no runtime type
+  // check, so resolveName can hand back a number or an object. `.replace` on
+  // those throws, and this is the {@html} mention path - one malformed profile
+  // would kill the render of every message that mentions it.
+  return String(str)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")

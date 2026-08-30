@@ -20,13 +20,18 @@ import {
   connect,
   transportState,
 } from "./transport.svelte";
-import type { VideoSource } from "./types";
 import { setTransmissionOutputVolume } from "./transmission.svelte";
+import { buildShareOptions, classifyShareAudio } from "./share-audio";
+import { loadAudioPrefs, saveAudioPrefs } from "./audio-prefs";
+import {
+  cancelErrorClear,
+  describeMediaError,
+  setErrorWithAutoClear,
+} from "./call-error";
 
 let _voiceOutputBeforeDeafen = 1;
 let _videoOutputBeforeDeafen = 1;
 let _mutedBeforeDeafen = false;
-
 export function _sendCallState(peerId?: string): void {
   const payload = encode({
     type: MessageType.CallState,
@@ -98,24 +103,45 @@ if (typeof document !== "undefined") {
 
 /**
  * In flight join. `transportState.inCall` only flips once the awaits below
- * finish, so a second tap on "Join call" used to re-enter and race the first:
- * both registered the /voice/1.0.0 handler and libp2p threw "Handler already
- * registered", failing the whole join.
+ * finish, so a second tap on "Join call" used to re-enter and race the first,
+ * building two audio pipelines against one microphone.
  */
 let _joinPromise: Promise<void> | null = null;
+/**
+ * Set when the user leaves while a join is still in flight.
+ *
+ * leaveCall() only unwinds `if (transportState.inCall)`, which is false until
+ * the very end of _joinCall - so pressing join then leave landed the user in a
+ * call they had already backed out of, with the leave's own cleanup having run
+ * first. The join checks this after each await and unwinds itself instead.
+ */
+let _joinAbandoned = false;
 
 export function joinCall(): Promise<void> {
   if (_joinPromise) return _joinPromise;
   if (transportState.inCall) return Promise.resolve();
+  _joinAbandoned = false;
+  transportState.joiningCall = true;
   _joinPromise = _joinCall().finally(() => {
     _joinPromise = null;
+    transportState.joiningCall = false;
   });
   return _joinPromise;
+}
+
+/** Thrown to unwind a join the user has already left. Never surfaced. */
+const ABANDONED = Symbol("join abandoned");
+
+function throwIfAbandoned(): void {
+  if (_joinAbandoned) throw ABANDONED;
 }
 
 let _presenceHeartbeat: ReturnType<typeof setInterval> | null = null;
 
 async function _joinCall(): Promise<void> {
+  // Clear any pending error timeout and reset the error state. Attempting
+  // the operation again makes any stale error irrelevant.
+  cancelErrorClear();
   transportState.error = null;
   try {
     // Ensure transport is connected before joining voice
@@ -128,8 +154,20 @@ async function _joinCall(): Promise<void> {
     // to a minute, and no voice link can exist before the peer connection
     // does - which is how hopping into a call ended up connecting to one
     // person immediately and the rest a couple of minutes later.
+    throwIfAbandoned();
     _transport.reconcileNow();
     await _voice.join(transportState.roomCode ?? "");
+    throwIfAbandoned();
+    // Set before the first roster sync below: _syncVoiceRoster reads inCall
+    // and callRoomCode to know who belongs in this call. Setting them AFTER
+    // _video.join() used to hand the voice layer an empty roster (default-
+    // deny, nobody admitted) for that whole network round trip - every
+    // offer arriving in that window was silently dropped, sometimes for the
+    // full 30s setup deadline (finding 6). Voice is peer-to-peer and does
+    // not depend on the SFU, so there is no reason this waits for it.
+    transportState.inCall = true;
+    transportState.callRoomCode = transportState.roomCode; // Track which room the call is in
+    _syncVoiceRoster();
     // Voice is peer-to-peer; only camera and screen share go through the SFU.
     // Awaiting this unguarded meant a media server that was down (or a VPS
     // whose DNS had moved) failed the whole join, taking out calls that never
@@ -141,11 +179,9 @@ async function _joinCall(): Promise<void> {
       // all that is left is to keep trying in the background.
       _video.ensureLive();
     }
-    transportState.inCall = true;
-    transportState.callRoomCode = transportState.roomCode; // Track which room the call is in
+    throwIfAbandoned();
     // Peers already in this call are known from their presence heartbeats -
-    // hand them over now rather than waiting for the next heartbeat, which is
-    // the difference between hearing people at once and 20s of silence.
+    // sync again in case one arrived while _video.join() was in flight.
     _syncVoiceRoster();
     acquireWakeLock();
     playJoinSound();
@@ -172,12 +208,32 @@ async function _joinCall(): Promise<void> {
     transportState.localMicStream = null;
     transportState.cameraOff = true;
     transportState.screenSharing = false;
-    transportState.error = err instanceof Error ? err.message : String(err);
+    // An abandoned join is not a failure - the user left on purpose, and the
+    // unwinding above is exactly the cleanup they asked for.
+    if (err === ABANDONED) return;
+    // Set error with auto-clear: transient permission errors should not persist
+    // indefinitely on screen. If the join fails for another reason, the error
+    // still clears after 10 seconds or when the user attempts to join again.
+    setErrorWithAutoClear(transportState, describeMediaError(err));
     throw err;
   }
 }
 
 export function leaveCall(): void {
+  // Tell any in-flight join to unwind. Without this the join runs to
+  // completion after the user has left and puts them back in the call.
+  if (_joinPromise) _joinAbandoned = true;
+  // Clear any pending error auto-clear timer and the error itself. Once the
+  // user leaves the call, any call-related error (like a permission denial
+  // during camera startup) becomes stale.
+  cancelErrorClear();
+  transportState.error = null;
+
+  // Close any open browser PiP window when the call ends.
+  if (typeof document !== "undefined" && document.pictureInPictureElement) {
+    document.exitPictureInPicture().catch(() => {});
+  }
+
   releaseWakeLock();
   if (_presenceHeartbeat) {
     clearInterval(_presenceHeartbeat);
@@ -191,6 +247,12 @@ export function leaveCall(): void {
   }
   stopCamera();
   stopScreenShare();
+  // Deafened, then left: setOutputVolume(0) zeroed _voice's persisted gain
+  // and leave() never resets it, so the NEXT join seeded every peer's gain
+  // node at 0 while the deafen icon read normal (finding 5). setDeafened(
+  // false) restores it to what it was before deafening; guarded so a
+  // non-deafened leave (the common path) does not play the undeafen chime.
+  if (transportState.deafened) setDeafened(false);
   _voice.leave();
   _video.leave();
   transportState.inCall = false;
@@ -203,7 +265,6 @@ export function leaveCall(): void {
   transportState.localMicStream = null;
   transportState.cameraOff = true;
   transportState.screenSharing = false;
-  transportState.sfuPeerIds = new Set();
   transportState.pendingTransmissions = new Map();
   transportState.transmissionViewers = new Map();
   transportState.watchingTransmissionPeerId = null;
@@ -230,6 +291,9 @@ export function toggleMute(): void {
 }
 
 export async function startCamera(): Promise<void> {
+  // Clear any pending error timeout and reset the error state. Attempting
+  // the operation again makes any stale error irrelevant.
+  cancelErrorClear();
   transportState.error = null;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -255,7 +319,11 @@ export async function startCamera(): Promise<void> {
       throw err;
     }
   } catch (err) {
-    transportState.error = err instanceof Error ? err.message : String(err);
+    // Set error with auto-clear: permission errors should not persist
+    // indefinitely on screen. The user is still in the call after camera
+    // startup fails, so the error clears when they retry or when the timer
+    // expires.
+    setErrorWithAutoClear(transportState, describeMediaError(err));
     throw err;
   }
 }
@@ -268,70 +336,155 @@ export function stopCamera(): void {
   _video.stopCamera();
 }
 
-export async function toggleCamera(): Promise<void> {
-  if (transportState.cameraOff) await startCamera();
-  else stopCamera();
+/**
+ * In-flight guards for the media toggles.
+ *
+ * startCamera/startScreenShare await getUserMedia/getDisplayMedia, which can
+ * sit for seconds behind a permission prompt. Nothing stopped a second press
+ * in that window, so a start and a stop could interleave and leave the flag
+ * and the actual track disagreeing.
+ */
+let _cameraPromise: Promise<void> | null = null;
+let _screenPromise: Promise<void> | null = null;
+
+export function toggleCamera(): Promise<void> {
+  if (_cameraPromise) return _cameraPromise;
+  transportState.cameraPending = true;
+  _cameraPromise = (async () => {
+    if (transportState.cameraOff) await startCamera();
+    else stopCamera();
+  })()
+    .catch(() => {
+      // startCamera already reported it through transportState.error.
+    })
+    .finally(() => {
+      _cameraPromise = null;
+      transportState.cameraPending = false;
+    });
+  return _cameraPromise;
 }
 
-export async function startScreenShare(): Promise<void> {
+export function toggleScreenShare(): Promise<void> {
+  if (_screenPromise) return _screenPromise;
+  transportState.screenSharePending = true;
+  _screenPromise = (async () => {
+    if (transportState.screenSharing) stopScreenShare();
+    else await startScreenShare();
+  })()
+    .catch(() => {
+      // startScreenShare already reported it through transportState.error.
+    })
+    .finally(() => {
+      _screenPromise = null;
+      transportState.screenSharePending = false;
+    });
+  return _screenPromise;
+}
+
+/**
+ * Starts (or accepts a pre-captured) screen share, then decides whether its
+ * audio track is safe to send.
+ *
+ * `stream` lets a caller that already ran getDisplayMedia hand the result
+ * straight in - the VideoTransport interface has always supported this (see
+ * types.ts) to avoid a second capture prompt. Either way the resulting
+ * track's REAL settings get classified: what we asked for and what the
+ * platform actually did can differ, and only the actual settings say
+ * whether the echo is really gone.
+ */
+export async function startScreenShare(stream?: MediaStream): Promise<void> {
+  // Clear any pending error timeout and reset the error state. Attempting
+  // the operation again makes any stale error irrelevant.
+  cancelErrorClear();
   transportState.error = null;
-  if (!navigator.mediaDevices.getDisplayMedia) {
+  if (!stream && !navigator.mediaDevices.getDisplayMedia) {
     throw new Error("Screen sharing is not supported on this device");
   }
   try {
-    // Game and media audio verbatim: mic-style processing (AEC, noise
-    // suppression, AGC) mangles music and adds nothing to a loopback
-    // capture. The extra hints are Chromium-only and ignored elsewhere:
-    // they surface the audio checkbox for screens, hide our own tab from
-    // the picker, and let the sharer switch surfaces mid-share.
-    const options = {
-      video: { frameRate: { ideal: 30 } },
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-        // Stereo at full rate: without asking, Chromium hands over mono.
-        channelCount: 2,
-        sampleRate: 48000,
-      },
-      systemAudio: "include",
-      selfBrowserSurface: "exclude",
-      surfaceSwitching: "include",
-    } as MediaStreamConstraints;
-    const stream = await navigator.mediaDevices.getDisplayMedia(options);
-    // Whole-screen audio loops the call itself back into the stream, so
-    // everyone hears their own voice with a delay. Window audio (Chrome or
-    // Edge on Windows) carries only that app's sound - tell the sharer.
-    const surface = stream
-      .getVideoTracks()[0]
-      ?.getSettings?.().displaySurface;
-    if (surface === "monitor" && stream.getAudioTracks().length > 0) {
-      _transport.announce({
-        type: "app-warning",
-        message:
-          "Sharing the whole screen sends ALL system audio - people will hear themselves. Share the game window instead (with 'Also share audio') to send only its sound.",
-      });
-    }
+    const captured =
+      stream ??
+      (await navigator.mediaDevices.getDisplayMedia(
+        buildShareOptions(navigator.mediaDevices.getSupportedConstraints())
+      ));
+
     // "music" keeps the browser's encoder from treating loopback audio as
     // speech. Video hint stays unset: "motion" would smooth games but smear
     // shared text, and we cannot know which this share is.
-    for (const track of stream.getAudioTracks()) track.contentHint = "music";
-    transportState.localScreenStream = stream;
+    for (const track of captured.getAudioTracks())
+      track.contentHint = "music";
+
+    // windowAudio degrades to system audio SILENTLY, and
+    // getSupportedConstraints().restrictOwnAudio lies on platforms (Linux)
+    // that can never honour it - so classify what the live tracks actually
+    // report, never what was requested.
+    const videoTrack = captured.getVideoTracks()[0];
+    let audioTrack: MediaStreamTrack | null =
+      captured.getAudioTracks()[0] ?? null;
+    const verdict = classifyShareAudio(
+      videoTrack?.getSettings() ?? {},
+      audioTrack?.getSettings() ?? null
+    );
+
+    if (verdict.kind === "echo-risk" && audioTrack) {
+      if (loadAudioPrefs().shareAudioDespiteEchoRisk) {
+        _transport.announce({
+          type: "app-warning",
+          message: `${verdict.message} Sending it anyway - "Send screen-share audio despite echo risk" is on in Settings > Audio.`,
+        });
+      } else {
+        // Default to safety: withhold the track so nobody hears themselves.
+        // Stop it too, or the OS-level capture session for audio nobody
+        // gets stays alive for the rest of the share.
+        audioTrack.stop();
+        captured.removeTrack(audioTrack);
+        audioTrack = null;
+        _transport.announce({
+          type: "app-warning",
+          message: verdict.message,
+        });
+      }
+    }
+
+    if (audioTrack) {
+      // The spec mandates a muted track when own-audio suppression leaves
+      // nothing to send, and a default-output-device change mid-share is a
+      // known real cause (crbug 1432877) - either way, tell the sharer
+      // rather than let the share go silently dead.
+      audioTrack.onmute = () => {
+        _transport.announce({
+          type: "app-warning",
+          message:
+            "This share's audio went silent - often caused by switching audio output devices mid-share.",
+        });
+      };
+      audioTrack.onunmute = () => {
+        _transport.announce({
+          type: "app-warning",
+          message: "This share's audio is back.",
+        });
+      };
+    }
+
+    transportState.localScreenStream = captured;
     transportState.screenSharing = true;
     playScreenShareStartSound();
-    stream.getVideoTracks()[0].onended = () => stopScreenShare();
+    videoTrack.onended = () => stopScreenShare();
     try {
-      await _video.startScreenShare(stream);
+      await _video.startScreenShare(captured);
     } catch (err) {
       // As with the camera: otherwise we advertise a transmission that does
       // not exist and the browser keeps the capture indicator up.
-      stream.getTracks().forEach((t) => t.stop());
+      captured.getTracks().forEach((t) => t.stop());
       transportState.localScreenStream = null;
       transportState.screenSharing = false;
       throw err;
     }
   } catch (err) {
-    transportState.error = err instanceof Error ? err.message : String(err);
+    // Set error with auto-clear: permission errors should not persist
+    // indefinitely on screen. The user is still in the call after screen share
+    // startup fails, so the error clears when they retry or when the timer
+    // expires.
+    setErrorWithAutoClear(transportState, describeMediaError(err));
     throw err;
   }
 }
@@ -344,15 +497,25 @@ export function stopScreenShare(): void {
   _video.stopScreenShare();
 }
 
-export function pauseVideo(source: VideoSource): void {
-  _video.pauseVideo(source);
+/**
+ * The sharer's device-local choice to send screen-share audio even when it
+ * could not be confirmed echo-free. Off by default (see startScreenShare) -
+ * this never travels to the room, it only decides what THIS device
+ * publishes on its next share.
+ */
+export function getShareAudioDespiteEchoRisk(): boolean {
+  return loadAudioPrefs().shareAudioDespiteEchoRisk;
 }
-export function resumeVideo(source: VideoSource): void {
-  _video.resumeVideo(source);
+
+export function setShareAudioDespiteEchoRisk(enabled: boolean): void {
+  saveAudioPrefs({ shareAudioDespiteEchoRisk: enabled });
 }
 
 export function setDeafened(deafened: boolean): void {
   if (deafened) {
+    // Optional chaining keeps older/test transport doubles compatible while
+    // the concrete voice transport always provides this capability.
+    _voice.stopCallAudio?.();
     // Save current states before deafening
     _voiceOutputBeforeDeafen = _voice.getOutputVolume();
     _videoOutputBeforeDeafen = transportState.transmissionOutputVolume;

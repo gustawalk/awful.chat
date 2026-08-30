@@ -1,4 +1,4 @@
-import { transportState } from "./transport.svelte";
+import { transportState, _transport } from "./transport.svelte";
 import {
   loadAudioPrefs,
   loadPeerVolume,
@@ -49,6 +49,8 @@ export function initVoice(voice: LibP2PVoice, dtln: DtlnProcessor): void {
       videoTrack: null,
       screenTrack: null,
       screenAudioTrack: null,
+      videoStalled: false,
+      screenStalled: false,
     };
     transportState.participants = new Map(transportState.participants).set(
       peerId,
@@ -85,6 +87,15 @@ export function initVoice(voice: LibP2PVoice, dtln: DtlnProcessor): void {
 
   _voice.on("error", (err) => {
     transportState.error = err.message;
+  });
+
+  // voice.ts's own status statuses (voice-peer-left, voice-connection-
+  // failed, voice-degraded, voice-dial-failed, voice-ice-connected) reach
+  // nobody without this: they fire on LibP2PVoice's own handler map, and
+  // TransportStatus.svelte/CallStatus.svelte/VoiceVideoCallView.svelte all
+  // listen on _transport's "status" stream instead (finding 8).
+  _voice.on("status", (status) => {
+    _transport.announce(status);
   });
 
   restoreVoicePrefs();
@@ -244,4 +255,24 @@ export async function setVoiceDtlnEnabled(enabled: boolean): Promise<void> {
 
 export function getVoiceDtlnEnabled(): boolean {
   return getVoice().isDtlnEnabled();
+}
+
+export function getCallAudioBlockedReason(): "not-in-call" | "deafened" | null {
+  if (!transportState.inCall) return "not-in-call";
+  if (transportState.deafened) return "deafened";
+  return null;
+}
+
+export async function playCallAudio(
+  blob: Blob,
+  options?: { volume?: number }
+): Promise<{ id: string; durationMs: number }> {
+  const blocked = getCallAudioBlockedReason();
+  if (blocked === "not-in-call") throw new Error("Join the call to play");
+  if (blocked === "deafened") throw new Error("Undeafen to play");
+  return getVoice().playCallAudio(blob, options);
+}
+
+export function stopCallAudio(id?: string): void {
+  _voice?.stopCallAudio(id);
 }

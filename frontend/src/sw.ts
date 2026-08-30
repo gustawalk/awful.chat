@@ -67,7 +67,8 @@ precacheAndRoute(
 
 // Big, rarely-needed assets are kept OUT of the precache (see globIgnores in
 // vite.config.ts) and cached the first time they are actually used instead:
-//   - the DTLN wasm worklet (~8 MB), fetched once on first app start
+//   - the DTLN wasm worklet (~8 MB), warmed once in the idle time after
+//     app start and loaded on first voice use
 //   - shiki language chunks (~300 files), fetched only when a code block of
 //     that language is rendered
 // Precaching them cost every visitor ~16 MB on install and on every update.
@@ -81,15 +82,61 @@ function runtimeCacheName(url: URL): string | null {
   return null;
 }
 
-async function cacheFirst(request: Request, cacheName: string): Promise<Response> {
+async function cacheFirst(
+  request: Request,
+  cacheName: string,
+  exclusive = false
+): Promise<Response> {
   const cache = await caches.open(cacheName);
   const hit = await cache.match(request);
   if (hit) return hit;
   const response = await fetch(request);
-  // Hashed filenames, so a successful response is safe to keep forever.
-  if (response.ok) cache.put(request, response.clone()).catch(() => {});
+  // Entries are content-versioned (hashed filename or ?v= query), so a
+  // successful response is safe to keep until its URL changes.
+  if (response.ok) {
+    if (exclusive) {
+      // One live version: a changed ?v= misses the cache above, lands here,
+      // and replaces the superseded entry instead of accumulating 8 MB blobs.
+      try {
+        for (const key of await cache.keys()) await cache.delete(key);
+      } catch {
+        // noop: worst case the old entry lingers
+      }
+    }
+    cache.put(request, response.clone()).catch(() => {});
+  }
   return response;
 }
+
+/**
+ * A share POST cannot be attributed to its sender from inside a service
+ * worker. Origin and Sec-Fetch-Site are appended after the fetch event is
+ * dispatched, so they are simply absent from request.headers here
+ * (whatwg/fetch#1322 exists to fix exactly that), and the referrer is one
+ * referrerpolicy="no-referrer" away from being empty - which is what a
+ * hostile page sets and a genuine OS share may carry anyway. A referrer test
+ * therefore rejects nobody who tries while risking every real share, so we
+ * do not run one.
+ *
+ * What a page cannot fake is the shape of the navigation it caused. A share
+ * is always a top-level navigation: the share sheet opens the app. A form
+ * auto-submitted into a hidden iframe or an <object> is the only shape that
+ * can plant payloads and hammer the storage quota in a loop without the user
+ * ever seeing it, and that is what this rejects. A top-level POST from a
+ * hostile page still reaches the handler - it also drags the user onto our
+ * own origin in a visible tab, one payload per navigation, and the bounds in
+ * storeSharedPayload are what keep that from costing anything.
+ *
+ * This is a deny list on purpose: an unfamiliar destination passes, because
+ * silently dropping a real share is worse than storing a bounded record.
+ */
+const NESTED_NAVIGATION_DESTINATIONS = new Set([
+  "iframe",
+  "frame",
+  "fencedframe",
+  "embed",
+  "object",
+]);
 
 /** The app is a SPA: every in-scope navigation is served by index.html. */
 async function handleNavigation(request: Request): Promise<Response> {
@@ -104,6 +151,9 @@ self.addEventListener("fetch", (event) => {
   if (request.method === "POST") {
     const url = new URL(request.url);
     if (url.pathname !== "/share-target") return;
+    // Not answering leaves the POST to the network, where nginx serves a
+    // static path and returns 405 - nothing is stored either way.
+    if (NESTED_NAVIGATION_DESTINATIONS.has(request.destination)) return;
 
     event.respondWith(
       (async () => {
@@ -139,13 +189,21 @@ self.addEventListener("fetch", (event) => {
   // Without this the app simply does not open offline: precacheAndRoute only
   // matches exact URLs, so /app and /r/<code> miss the cache entirely even
   // though every message already lives on the device.
+  // A path with a file extension is a real file, not an app route:
+  // /third-party-notices.txt opened in a new tab is a navigation too, and
+  // answering it with the shell showed the app where the licenses should be.
+  // nginx already falls back to index.html for anything it cannot find.
   if (request.mode === "navigate") {
-    event.respondWith(handleNavigation(request));
+    if (!/\.[a-z0-9]+$/i.test(new URL(request.url).pathname)) {
+      event.respondWith(handleNavigation(request));
+    }
     return;
   }
 
   const cacheName = runtimeCacheName(new URL(request.url));
   if (cacheName) {
-    event.respondWith(cacheFirst(request, cacheName));
+    event.respondWith(
+      cacheFirst(request, cacheName, cacheName === WORKLET_CACHE)
+    );
   }
 });

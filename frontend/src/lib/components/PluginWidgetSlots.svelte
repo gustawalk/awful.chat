@@ -136,7 +136,7 @@
         class="mx-2 mb-1 max-h-44 overflow-y-auto rounded-md border border-border bg-popover py-1 shadow-md"
       >
         <div
-          class="flex items-center justify-between px-2 pb-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground"
+          class="select-none flex items-center justify-between px-2 pb-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground"
         >
           <span>Pin a plugin</span>
           <button
@@ -165,7 +165,7 @@
               onclick={() => pick(c)}
               class="flex w-full cursor-pointer items-center gap-1.5 px-2 py-1 text-left hover:bg-muted"
             >
-              <PluginIcon icon={m?.icon ?? "🔌"} class="size-3 shrink-0" />
+              <PluginIcon icon={m?.icon ?? "lucide:unplug"} class="size-3 shrink-0" />
               <span class="truncate font-mono text-[11px]"
                 >{m?.name ?? c.pluginId}</span
               >

@@ -47,7 +47,24 @@ const MAX_RENDEZVOUS_FRAME_BYTES = 16 * 1024;
 const PEER_REDIAL_DELAY_MS = 3_000;
 const PEER_REDIAL_MAX_MS = 60_000;
 const RELAY_RECONNECT_DELAY_MS = 3_000;
+// The FIRST relay dial gets retries of its own. libp2p's dial has no
+// failure cooldown, so a re-dial genuinely re-attempts, and a browser that
+// just woke a radio, switched networks or lost a TLS handshake fails the
+// first one routinely. Without this, one transient WebSocket error made
+// connect() throw - the app papered over it with its own connect retry, but
+// device sync had no such net and simply died ("relay dial failed").
+const RELAY_DIAL_ATTEMPTS = 4;
+const RELAY_DIAL_BASE_MS = 700;
+const RELAY_DIAL_MAX_MS = 6_000;
 const CONNECTION_RECONCILE_MS = 5_000;
+/**
+ * Upstream libp2p's own grace period for `connection.close()` to finish
+ * (`@libp2p/connection-manager`'s `CONNECTION_CLOSE_TIMEOUT`). A connection
+ * dropPeer just closed still shows up in `getConnections()` for up to this
+ * long - the window a reconcile tick can walk into and re-register a peer
+ * whose old connection has not actually gone yet.
+ */
+const CONNECTION_CLOSE_TIMEOUT_MS = 1_000;
 /**
  * The gap between upgrade attempts, and the ceiling once they keep failing.
  * The FIRST attempt goes out on the next reconcile tick, not after this delay.
@@ -62,6 +79,16 @@ const PING_MISSES_ALLOWED = 2;
 /** A fresh stream is pinged this often until its first pong. */
 const STREAM_CONFIRM_INTERVAL_MS = 700;
 const STREAM_CONFIRM_ATTEMPTS = 8;
+/**
+ * How long probeSilentPeers waits before judging one missed probe,
+ * independent of the send() promise it rides on. A stream that never
+ * confirms holds the ping on the pending queue for the whole confirm
+ * budget before send() resolves at all - chaining the release to that
+ * promise doubled the stated timeout, and an unbounded queue could pin it
+ * forever. This is the stated bound instead.
+ */
+const PEER_PROBE_RELEASE_MS =
+  STREAM_CONFIRM_INTERVAL_MS * STREAM_CONFIRM_ATTEMPTS + PEER_PING_TIMEOUT_MS;
 // Liveness lives at this layer rather than as a libp2p service: the ping
 // package pulls in a second copy of @libp2p/interface and the type skew breaks
 // the build. These ride the direct stream we already keep open. Pings carry a
@@ -78,10 +105,18 @@ function pongFrame(nonce: number): Uint8Array {
   return new TextEncoder().encode(JSON.stringify({ type: "__pong", n: nonce }));
 }
 const RENDEZVOUS_RECONNECT_DELAY_MS = 2_000;
+/**
+ * How often a registered rendezvous stream proves it is alive. The relay
+ * closes a registered stream that stays quiet for three intervals
+ * (`rendezvousLivenessTimeout` in relay/main.go), so this number is a
+ * contract with the relay: raising it eats the two-miss margin.
+ */
+const RENDEZVOUS_PING_INTERVAL_MS = 20_000;
 
 type RendezvousClientMsg =
   | { type: "REGISTER"; room: string }
-  | { type: "UNREGISTER"; room: string };
+  | { type: "UNREGISTER"; room: string }
+  | { type: "PING" };
 
 type RendezvousServerMsg =
   | { type: "PEERS"; room: string; peers: string[] }
@@ -91,6 +126,13 @@ type RendezvousServerMsg =
 function roomTopic(roomCode: string) {
   return `app:room:${roomCode}`;
 }
+
+/**
+ * The handle a timer returns. The browser hands back a number and Node hands
+ * back an object, and @types/node is in scope here, so the type is named once
+ * rather than spelled out at every field that holds one.
+ */
+type TimerHandle = ReturnType<typeof setInterval>;
 
 /** libp2p streams expose a status; anything but "open" cannot be written to. */
 function streamIsOpen(stream: Stream): boolean {
@@ -116,9 +158,30 @@ export class LibP2PTransport implements PeerTransport {
   private handlers = new Map<keyof TransportEvents, Set<Function>>();
   private relayedPeers = new Set<string>();
   private connectedPeers = new Set<string>();
+  /**
+   * peerId -> when dropPeer last closed this peer's connections.
+   *
+   * dropPeer calls connection.close() without awaiting it, and libp2p's
+   * graceful close can take up to CONNECTION_CLOSE_TIMEOUT_MS - during
+   * which getConnections() still returns the dying connection. Without this,
+   * the next reconcile tick sees it, re-registers the peer, and resends
+   * everything into a connection that is about to die: a connect/disconnect
+   * flap every few seconds.
+   */
+  private droppedAt = new Map<string, number>();
   private relayPeerId: string | null = null;
   private rendezvousStream: Stream | null = null;
   private rendezvousReadBuf: Uint8Array = new Uint8Array(0);
+  /**
+   * True while a rendezvous dial is in flight. Four call sites start the
+   * rendezvous - connect, the relay-reconnect retry, the dial-failure retry
+   * and the stream's own close handler - and two of them can fire for the
+   * same drop. Without this guard each dial opened its own stream and the
+   * last assignment won, so every earlier stream stayed open on the relay,
+   * unread, holding a slot against the relay's per-peer stream ceiling.
+   */
+  private rendezvousStarting = false;
+  private rendezvousPingTimer: TimerHandle | null = null;
 
   private peerStreams = new Map<string, Stream>();
   /**
@@ -166,6 +229,20 @@ export class LibP2PTransport implements PeerTransport {
   private lastInbound = new Map<string, number>();
   private pinging = new Set<string>();
   private pingMisses = new Map<string, number>();
+  /**
+   * When each outstanding RTT probe was sent, by nonce.
+   *
+   * Separate from the liveness pings, which only ever asked "did anything
+   * come back", never "how long did it take". A probe answers on the peer's
+   * receive path BEFORE any app work - signing, the reducer, rendering - so
+   * what this measures is the connection rather than the application, which
+   * is the useful half: a fast ping with slow chat points at the relay or
+   * the message pipeline instead of at the link.
+   */
+  private rttProbes = new Map<
+    number,
+    { peerId: string; sentAt: number; settle: (rtt: number | null) => void }
+  >();
   private pingNonceCounter = 0;
   /** Nonces issued for the CURRENT unconfirmed stream, per peer. */
   private confirmNonces = new Map<string, Set<number>>();
@@ -197,14 +274,13 @@ export class LibP2PTransport implements PeerTransport {
    * could never make safely.
    */
   private confirmedStreams = new WeakSet<Stream>();
-  private confirmTimers = new Map<string, ReturnType<typeof setInterval>>();
+  private confirmTimers = new Map<string, TimerHandle>();
   /** Dev counters. Connection-layer faults are invisible without them: every
    *  side looks connected while writes vanish into a dead circuit. */
   readonly debugStats = {
     identifies: 0,
     connects: 0,
     disconnects: 0,
-    staleConnectionsClosed: 0,
     relayUpgradeAttempts: 0,
     relayUpgrades: 0,
     livenessDrops: 0,
@@ -223,8 +299,8 @@ export class LibP2PTransport implements PeerTransport {
   // set to true only by disconnect() - prevents any reconnect logic from firing
   private intentionalDisconnect = false;
 
-  private relayReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private reconcileTimer: ReturnType<typeof setInterval> | null = null;
+  private relayReconnectTimer: TimerHandle | null = null;
+  private reconcileTimer: TimerHandle | null = null;
   private privateKeyBytes: Uint8Array | null = null;
 
   constructor() {
@@ -262,6 +338,18 @@ export class LibP2PTransport implements PeerTransport {
     this.installStreamNoiseFilter();
     this.intentionalDisconnect = false;
 
+    // A reconnect used to leak the previous node's timers: reconcileTimer was
+    // overwritten (leaving an interval running against a dead node forever)
+    // and a pending relayReconnectTimer could fire into the new one.
+    if (this.reconcileTimer) {
+      clearInterval(this.reconcileTimer);
+      this.reconcileTimer = null;
+    }
+    if (this.relayReconnectTimer) {
+      clearTimeout(this.relayReconnectTimer);
+      this.relayReconnectTimer = null;
+    }
+
     // A previous failed connect may have left a half-started node behind -
     // stop it so retries don't leak libp2p nodes.
     if (this.node) {
@@ -274,7 +362,18 @@ export class LibP2PTransport implements PeerTransport {
     // would suppress future "connect" events; stale streams can't be reused.
     // joinedRooms is intentionally KEPT - it's re-subscribed below.
     this.connectedPeers.clear();
+    // Announced, not just cleared. The app mirrors this set reactively, and
+    // a silent wipe leaves stale entries behind: a peer that reconnects
+    // DIRECTLY then produces no relayChanged (was === false already), so its
+    // relay badge stays lit for the rest of the session.
+    for (const id of this.relayedPeers) this.emit("relayChanged", id, false);
     this.relayedPeers.clear();
+    // Same reasoning as relayedPeers above: announce the withdrawal, don't
+    // just drop it, or the app's provenPeers mirror keeps a peer proven
+    // across a reconnect that gave them a brand new, unconfirmed stream.
+    for (const [id, stream] of this.peerStreams) {
+      if (this.confirmedStreams.has(stream)) this.emit("streamLost", id);
+    }
     this.peerStreams.clear();
     for (const pid of [...this.pendingQueues.keys()])
       this.failPendingQueue(pid);
@@ -286,6 +385,8 @@ export class LibP2PTransport implements PeerTransport {
     this.nextUpgradeAt.clear();
     this.upgradeBackoff.clear();
     this.liveConnections.clear();
+    this.stopRendezvousPing();
+    this.rendezvousStarting = false;
     this.rendezvousStream = null;
 
     if (privateKeyBytes) this.privateKeyBytes = privateKeyBytes;
@@ -336,7 +437,12 @@ export class LibP2PTransport implements PeerTransport {
         );
       },
       // Never let a duplicate registration abort a (re)connect; see voice.ts.
-      { force: true }
+      // runOnLimitedConnection matches the dial side (openOutboundStream,
+      // rendezvous): currently a no-op, since the relay grants circuits no
+      // limits, but the assumption lives in the Go relay while this was the
+      // one registration that omitted it - a relay that ever grants limits
+      // would make every relayed peer connect and carry nothing.
+      { force: true, runOnLimitedConnection: true }
     );
 
     await this.node.start();
@@ -374,6 +480,7 @@ export class LibP2PTransport implements PeerTransport {
     this.node.addEventListener("peer:identify", (evt: any) => {
       const id = evt.detail.peerId.toString();
       if (this.isRelayPeer(id)) return;
+      this.debugStats.identifies++;
       // Handle EVERY identify, not just the first.
       //
       // A peer that reloads keeps its peerId, and the relay keeps the old
@@ -400,7 +507,18 @@ export class LibP2PTransport implements PeerTransport {
       throw err;
     }
     await this.requestRelayReservation();
-    await this.waitForRelayReservation();
+    if (!(await this.waitForRelayReservation())) {
+      // No reservation means nobody can reach US: a browser cannot listen, so
+      // every inbound path runs through the relay circuit. One more attempt
+      // covers the common case of the first request racing the relay dial.
+      // (A reservation that failed with a DialError poisons libp2p's own
+      // relay filter for the lifetime of this node - the retry then fails
+      // fast with "previously invalid", and the app's connect retry, which
+      // builds a FRESH node, is the real recovery.)
+      console.warn("[Transport] no relay reservation, retrying once");
+      await this.requestRelayReservation();
+      await this.waitForRelayReservation();
+    }
 
     // Anything that connected before the listeners existed (or whose event we
     // missed for any other reason) is picked up here.
@@ -412,6 +530,19 @@ export class LibP2PTransport implements PeerTransport {
 
     this.node.addEventListener(
       "connection:open",
+      (evt: CustomEvent<Connection>) => {
+        const id = evt.detail.remotePeer.toString();
+        if (!this.connectedPeers.has(id)) return;
+        this.updateRelayedStatus(id);
+      }
+    );
+
+    // updateRelayedStatus otherwise only ran on connect events and the
+    // hidden-gated upgrade refresh - so a peer whose direct connection died
+    // while its circuit survived kept its "direct" marking until the next
+    // visible reconcile tick, and the relay badge lied in the meantime.
+    this.node.addEventListener(
+      "connection:close",
       (evt: CustomEvent<Connection>) => {
         const id = evt.detail.remotePeer.toString();
         if (!this.connectedPeers.has(id)) return;
@@ -450,6 +581,7 @@ export class LibP2PTransport implements PeerTransport {
       this.liveConnections.delete(id);
       this.nextUpgradeAt.delete(id);
       this.upgradeBackoff.delete(id);
+      this.droppedAt.delete(id);
       this.cleanupPeerStream(id);
       this.emit("disconnect", id);
 
@@ -513,10 +645,20 @@ export class LibP2PTransport implements PeerTransport {
     } catch {}
     this.node = null;
     this.relayPeerId = null;
+    this.stopRendezvousPing();
+    this.rendezvousStarting = false;
     this.rendezvousStream = null;
     this.joinedRooms.clear();
     this.connectedPeers.clear();
+    // Announced, not just cleared. The app mirrors this set reactively, and
+    // a silent wipe leaves stale entries behind: a peer that reconnects
+    // DIRECTLY then produces no relayChanged (was === false already), so its
+    // relay badge stays lit for the rest of the session.
+    for (const id of this.relayedPeers) this.emit("relayChanged", id, false);
     this.relayedPeers.clear();
+    for (const [id, stream] of this.peerStreams) {
+      if (this.confirmedStreams.has(stream)) this.emit("streamLost", id);
+    }
     this.peerStreams.clear();
     for (const pid of [...this.pendingQueues.keys()])
       this.failPendingQueue(pid);
@@ -574,7 +716,7 @@ export class LibP2PTransport implements PeerTransport {
         );
         this.emit("status", {
           type: "stream-open-failed",
-          peerId: peerId.slice(-8),
+          peerId,
           message: `Failed to open stream to peer ${peerId.slice(-8)}`,
         });
         this.failPendingQueue(peerId);
@@ -625,6 +767,21 @@ export class LibP2PTransport implements PeerTransport {
     handler: TransportEvents[K]
   ): void {
     this.handlers.get(event)?.delete(handler);
+  }
+
+  /**
+   * Connected peers the RELAY has told us are registered in this room.
+   *
+   * Filled from the rendezvous PEERS reply and PEER_JOINED, so it is the
+   * relay's view of membership rather than anything a peer asserted. Used to
+   * decide who may be told that a room exists: a room code is the room's only
+   * membership secret, so naming a room to somebody outside it hands them the
+   * key to it.
+   */
+  peersInRoom(room: string): string[] {
+    const known = this.roomPeers.get(room);
+    if (!known) return [];
+    return [...known].filter((p) => this.connectedPeers.has(p));
   }
 
   peers(): string[] {
@@ -717,10 +874,16 @@ export class LibP2PTransport implements PeerTransport {
    * one.
    */
   private registerPeer(peerId: string): void {
-    // A peer we are seeing again must not reuse the stream from its previous
-    // incarnation: that stream can still report itself open while the far end
-    // is gone, so every write disappears into it.
-    this.cleanupPeerStream(peerId);
+    // A peer we are seeing again on a NEW connection must not reuse the
+    // stream from its previous incarnation: that stream can still report
+    // itself open while the far end is gone, so every write disappears into
+    // it. An ALREADY-connected peer identifying again must NOT be torn down
+    // here, though - glare makes two connections per pair routine (both
+    // sides dial each other from the same rendezvous reply), and every extra
+    // identify used to abort a stream that had just been confirmed.
+    // handleInboundStream already resets the outbound stream on a genuinely
+    // new connection, which is the one case that actually needs it.
+    if (!this.connectedPeers.has(peerId)) this.cleanupPeerStream(peerId);
     // Fresh incarnation, fresh liveness: a stale miss count from before a
     // reconnect would let a single missed probe drop a healthy peer, and an
     // unseeded lastInbound made the probe fire the moment a reconciled peer
@@ -728,6 +891,8 @@ export class LibP2PTransport implements PeerTransport {
     this.pingMisses.delete(peerId);
     this.lastInbound.set(peerId, Date.now());
     this.connectedPeers.add(peerId);
+    this.debugStats.connects++;
+    this.droppedAt.delete(peerId);
     this.updateRelayedStatus(peerId);
     this.nextDialAt.delete(peerId);
     this.dialBackoff.delete(peerId);
@@ -757,11 +922,17 @@ export class LibP2PTransport implements PeerTransport {
    */
   private probeSilentPeers(): void {
     if (!this.node || this.intentionalDisconnect) return;
-    if (typeof document !== "undefined" && document.hidden) return;
+    // A backgrounded tab still needs a detector, not none: a relayed
+    // connection keeps looking alive after the far end reloads or crashes
+    // (the relay holds the circuit open), and a mobile PWA can sit
+    // backgrounded for hours. Scale the threshold instead of skipping
+    // outright, so the radio stays quiet without going silent forever.
+    const hidden = typeof document !== "undefined" && document.hidden;
+    const silence = hidden ? PEER_SILENCE_MS * 4 : PEER_SILENCE_MS;
     const now = Date.now();
     for (const peerId of [...this.connectedPeers]) {
       if (this.pinging.has(peerId)) continue;
-      if (now - (this.lastInbound.get(peerId) ?? 0) < PEER_SILENCE_MS) continue;
+      if (now - (this.lastInbound.get(peerId) ?? 0) < silence) continue;
       // A stream mid-confirmation is already being pinged on a faster clock.
       const out = this.peerStreams.get(peerId);
       if (out && streamIsOpen(out) && !this.confirmedStreams.has(out)) {
@@ -769,27 +940,71 @@ export class LibP2PTransport implements PeerTransport {
       }
       this.pinging.add(peerId);
       const askedAt = Date.now();
-      void this.send(peerId, pingFrame(++this.pingNonceCounter)).finally(() => {
-        setTimeout(() => {
-          this.pinging.delete(peerId);
-          if (!this.connectedPeers.has(peerId)) return;
-          if ((this.lastInbound.get(peerId) ?? 0) >= askedAt) return;
-          // One missed answer is not proof: a slow phone looks the same as a
-          // dead one, and dropping a live peer tears down a working call.
-          const misses = (this.pingMisses.get(peerId) ?? 0) + 1;
-          this.pingMisses.set(peerId, misses);
-          if (misses < PING_MISSES_ALLOWED) return;
-          console.log("[Transport] peer stopped answering:", peerId.slice(-8));
-          this.debugStats.livenessDrops++;
-          this.pingMisses.delete(peerId);
-          this.dropPeer(peerId);
-        }, PEER_PING_TIMEOUT_MS);
-      });
+      // Fire and forget: send() can sit on the pending queue for the whole
+      // confirm budget before it resolves at all (or, if that queue never
+      // drains, forever). The release below no longer waits on it - see
+      // PEER_PROBE_RELEASE_MS.
+      void this.send(peerId, pingFrame(++this.pingNonceCounter));
+      setTimeout(() => {
+        this.pinging.delete(peerId);
+        if (!this.connectedPeers.has(peerId)) return;
+        if ((this.lastInbound.get(peerId) ?? 0) >= askedAt) return;
+        // One missed answer is not proof: a slow phone looks the same as a
+        // dead one, and dropping a live peer tears down a working call.
+        const misses = (this.pingMisses.get(peerId) ?? 0) + 1;
+        this.pingMisses.set(peerId, misses);
+        if (misses < PING_MISSES_ALLOWED) return;
+        console.log("[Transport] peer stopped answering:", peerId.slice(-8));
+        this.debugStats.livenessDrops++;
+        this.pingMisses.delete(peerId);
+        this.dropPeer(peerId);
+      }, PEER_PROBE_RELEASE_MS);
     }
+  }
+
+  /**
+   * Round-trip time to a peer, in milliseconds, or null if it did not answer
+   * in time.
+   *
+   * Null is loss, not slowness: a probe that never returns has no latency to
+   * report, and folding it in as a very large number would drag every
+   * average and wreck the scale of anything plotting the result.
+   */
+  async measureRtt(peerId: string, timeoutMs = 2000): Promise<number | null> {
+    if (!this.node || !this.connectedPeers.has(peerId)) return null;
+    const nonce = ++this.pingNonceCounter;
+    return new Promise<number | null>((resolve) => {
+      let done = false;
+      const settle = (rtt: number | null) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        this.rttProbes.delete(nonce);
+        resolve(rtt);
+      };
+      const timer = setTimeout(() => settle(null), timeoutMs);
+      // sentAt is recorded as late as possible - after the frame is built,
+      // just before it goes out - so the measurement is the wire, not our
+      // own serialisation.
+      this.rttProbes.set(nonce, {
+        peerId,
+        sentAt: performance.now(),
+        settle,
+      });
+      void this.send(peerId, pingFrame(nonce)).catch(() => settle(null));
+    });
   }
 
   private dropPeer(peerId: string): void {
     this.debugStats.disconnects++;
+    this.droppedAt.set(peerId, Date.now());
+    // Probes to a peer that just left resolve as loss now rather than
+    // sitting out their full timeout.
+    for (const [nonce, probe] of [...this.rttProbes]) {
+      if (probe.peerId !== peerId) continue;
+      this.rttProbes.delete(nonce);
+      probe.settle(null);
+    }
     this.pingMisses.delete(peerId);
     this.nextUpgradeAt.delete(peerId);
     this.upgradeBackoff.delete(peerId);
@@ -803,6 +1018,14 @@ export class LibP2PTransport implements PeerTransport {
       if (c.remotePeer.toString() === peerId) c.close().catch(() => {});
     }
     this.emit("disconnect", peerId);
+    // dropPeer deletes connectedPeers ABOVE closing the connections, so
+    // peer:disconnect's own dedup guard (`if (!this.connectedPeers.has(id))
+    // return`) sees the entry already gone and never reaches its redial.
+    // Without this, a liveness drop is permanent: the peer is absent from
+    // connectedPeers, absent from dialingPeers, and nothing else redials it.
+    if (!this.intentionalDisconnect) {
+      setTimeout(() => this.redialPeer(peerId), PEER_REDIAL_DELAY_MS);
+    }
   }
 
   private rememberRoomPeer(room: string, peerId: string): void {
@@ -814,16 +1037,43 @@ export class LibP2PTransport implements PeerTransport {
 
   private reconcileConnections(): void {
     if (!this.node) return;
-    for (const connection of this.node.getConnections()) {
+    const connections = this.node.getConnections();
+    // Surface runaway connection growth: the relay's conn manager prunes
+    // hard above its high-water mark, and a leak here reads as "peers
+    // randomly disconnecting" everywhere else.
+    if (connections.length > 50) {
+      console.warn(
+        `[Transport] high connection count: ${connections.length} ` +
+          `(${this.connectedPeers.size} peers)`
+      );
+    }
+    const byPeer = new Map<string, Connection[]>();
+    for (const connection of connections) {
       const id = connection.remotePeer.toString();
+      const list = byPeer.get(id);
+      if (list) list.push(connection);
+      else byPeer.set(id, [connection]);
       if (this.isRelayPeer(id) || this.connectedPeers.has(id)) continue;
+      // The connection dropPeer just closed can still show up here for up
+      // to CONNECTION_CLOSE_TIMEOUT_MS - re-registering into that window
+      // produces the connect/disconnect flap droppedAt exists to prevent.
+      const closingStill =
+        Date.now() - (this.droppedAt.get(id) ?? 0) < CONNECTION_CLOSE_TIMEOUT_MS;
+      if (closingStill) continue;
       console.log("[Transport] reconciled missed peer:", id.slice(-8));
       this.registerPeer(id);
       this.emit("connect", id);
     }
+    // peer:disconnect can only fire while the node is alive, so a connection
+    // lost across a node restart left a resident connectedPeers entry
+    // forever. Safe now that dropPeer redials on its own (finding 2) -
+    // dropping a peer nothing would ever dial back used to strand it.
+    for (const id of [...this.connectedPeers]) {
+      if (!byPeer.has(id)) this.dropPeer(id);
+    }
     this.probeSilentPeers();
     this.retryMissingRoomPeers();
-    this.upgradeRelayedPeers();
+    this.upgradeRelayedPeers(byPeer);
   }
 
   /**
@@ -840,21 +1090,29 @@ export class LibP2PTransport implements PeerTransport {
    * the dial really happens. (Not because circuit connections are "limited":
    * our relay grants infinite limits, so they are not.)
    */
-  private upgradeRelayedPeers(): void {
+  private upgradeRelayedPeers(byPeer?: Map<string, Connection[]>): void {
     if (this.intentionalDisconnect || !this.node) return;
-    if (typeof document !== "undefined" && document.hidden) return;
+    // Only the DIAL below is skipped while hidden, not the refresh - a
+    // relayed connection keeps looking alive after the far end reloads or
+    // crashes (the relay holds the circuit open), and gating the refresh
+    // too left the badge showing "direct" long after the direct connection
+    // actually died in the background.
+    const hidden = typeof document !== "undefined" && document.hidden;
     const now = Date.now();
     for (const peerId of [...this.connectedPeers]) {
       // Refresh first. updateRelayedStatus only ever ran on connect events, so
       // when a direct connection died the peer stayed marked direct forever -
       // the status shown in the UI went stale, and nothing here would have
-      // tried to win the direct connection back.
-      this.updateRelayedStatus(peerId);
+      // tried to win the direct connection back. The prefetched connection
+      // map keeps this O(peers): getPeers().find() per peer serialized every
+      // PeerId per iteration - profiled at over a second of CPU per tick.
+      this.updateRelayedStatus(peerId, byPeer?.get(peerId));
       if (!this.relayedPeers.has(peerId)) {
         this.nextUpgradeAt.delete(peerId);
         this.upgradeBackoff.delete(peerId);
         continue;
       }
+      if (hidden) continue; // keep the radio quiet in the background
       if (this.dialingPeers.has(peerId)) continue;
       const due = this.nextUpgradeAt.get(peerId) ?? 0;
       if (now < due) continue;
@@ -864,7 +1122,10 @@ export class LibP2PTransport implements PeerTransport {
         RELAY_UPGRADE_MAX_MS
       );
       this.upgradeBackoff.set(peerId, next);
-      this.nextUpgradeAt.set(peerId, now + next);
+      // Jittered like the relay dial below - see retryMissingRoomPeers for
+      // why an un-jittered peer backoff stays lockstepped with the pair on
+      // the other end of the same reservation race.
+      this.nextUpgradeAt.set(peerId, now + next + Math.random() * next * 0.3);
       this.upgradeToDirect(peerId).catch(() => {});
     }
   }
@@ -900,7 +1161,15 @@ export class LibP2PTransport implements PeerTransport {
     // twice, because both sides dial and each closed the one the other used.
     const live = this.liveConnections.get(peerId);
     if (live && live.remoteAddr.toString().includes("/p2p-circuit")) {
-      this.liveConnections.delete(peerId);
+      // Point outbound traffic at the connection the upgrade actually won,
+      // not at whichever one dialProtocol picks arbitrarily among several -
+      // that routinely landed back on the very circuit just left, so the
+      // app believed it was upgraded while every frame still rode the relay.
+      const direct = this.node
+        ?.getConnections(peerIdFromString(peerId))
+        .find((c) => c.direct);
+      if (direct) this.liveConnections.set(peerId, direct);
+      else this.liveConnections.delete(peerId);
     }
     // Move the traffic. resetOutboundStream, NOT cleanupPeerStream: the latter
     // fails the pending queue, and the claim that callers requeue only holds on
@@ -939,7 +1208,11 @@ export class LibP2PTransport implements PeerTransport {
           PEER_REDIAL_MAX_MS
         );
         this.dialBackoff.set(peerId, next);
-        this.nextDialAt.set(peerId, now + next);
+        // Jittered like the relay dial below: both sides of a pair learn
+        // about each other from the same rendezvous reply and retry in
+        // lockstep without this, colliding on the same reservation race
+        // every time.
+        this.nextDialAt.set(peerId, now + next + Math.random() * next * 0.3);
         this.dialPeer(peerId).catch(() => {});
       }
     }
@@ -952,21 +1225,62 @@ export class LibP2PTransport implements PeerTransport {
   private async dialRelay(): Promise<void> {
     if (!this.node) return;
     const relayMa = import.meta.env.VITE_RELAY_MULTIADDR as string;
-    try {
-      await this.node.dial(multiaddr(relayMa));
-      console.log("[Transport] relay connected");
-      this.emit("status", {
-        type: "relay-connected",
-        message: "Connected to relay",
-      });
-    } catch (err) {
-      console.error("[Transport] relay dial failed:", err);
-      this.emit("status", {
-        type: "relay-dial-failed",
-        message: "Failed to connect to relay",
-      });
-      throw err;
+    let lastErr: unknown = null;
+
+    for (let attempt = 0; attempt < RELAY_DIAL_ATTEMPTS; attempt++) {
+      // A disconnect() landing mid-backoff must ABORT the connect, not fall
+      // through: returning normally would send connect() on to attach
+      // listeners to a node that is already stopped (or null).
+      if (this.intentionalDisconnect || !this.node) {
+        throw new Error("relay dial aborted");
+      }
+      try {
+        await this.node.dial(multiaddr(relayMa));
+        console.log("[Transport] relay connected");
+        this.emit("status", {
+          type: "relay-connected",
+          message: "Connected to relay",
+        });
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (attempt === RELAY_DIAL_ATTEMPTS - 1) break;
+        // Jittered backoff: two devices starting a sync together would
+        // otherwise retry in lockstep and collide on the same failure.
+        const wait = Math.min(
+          RELAY_DIAL_BASE_MS * 2 ** attempt,
+          RELAY_DIAL_MAX_MS
+        );
+        const delay = wait + Math.random() * wait * 0.3;
+        console.warn(
+          `[Transport] relay dial attempt ${attempt + 1}/${RELAY_DIAL_ATTEMPTS} failed, retrying in ${Math.round(delay)}ms`
+        );
+        this.emit("status", {
+          type: "relay-dial-retry",
+          message: `Relay unreachable - retrying (${attempt + 1}/${RELAY_DIAL_ATTEMPTS})`,
+        });
+        await new Promise((r) => setTimeout(r, delay));
+      }
     }
+
+    console.error("[Transport] relay dial failed:", lastErr);
+    this.emit("status", {
+      type: "relay-dial-failed",
+      message: "Failed to connect to relay",
+    });
+    // A browser WebSocket failure arrives as a DOM Event, and every caller
+    // that showed it to a user rendered "[object Event]". Carry a sentence
+    // a person can act on instead, keeping the original as the cause.
+    const detail =
+      lastErr instanceof Error
+        ? lastErr.message
+        : lastErr && typeof lastErr === "object" && "type" in lastErr
+          ? `websocket ${(lastErr as { type: string }).type}`
+          : String(lastErr);
+    throw new Error(
+      `Could not reach the relay after ${RELAY_DIAL_ATTEMPTS} attempts (${detail}). Check your connection and try again.`,
+      { cause: lastErr }
+    );
   }
 
   private async requestRelayReservation(): Promise<void> {
@@ -1050,14 +1364,16 @@ export class LibP2PTransport implements PeerTransport {
         }
         stream = await this.node.dialProtocol(
           peerIdFromString(peerId),
-          DIRECT_MSG_PROTOCOL
+          DIRECT_MSG_PROTOCOL,
+          { runOnLimitedConnection: true }
         );
         this.debugStats.dialStreamOpens++;
       }
     } else {
       stream = await this.node.dialProtocol(
         peerIdFromString(peerId),
-        DIRECT_MSG_PROTOCOL
+        DIRECT_MSG_PROTOCOL,
+        { runOnLimitedConnection: true }
       );
       this.debugStats.dialStreamOpens++;
     }
@@ -1104,7 +1420,7 @@ export class LibP2PTransport implements PeerTransport {
     const pingOnce = () => {
       const nonce = ++this.pingNonceCounter;
       this.confirmNonces.get(peerId)?.add(nonce);
-      this.writeFrame(peerId, stream, pingFrame(nonce));
+      void this.writeFrame(peerId, stream, pingFrame(nonce));
     };
 
     const timer = setInterval(() => {
@@ -1156,6 +1472,10 @@ export class LibP2PTransport implements PeerTransport {
     const stream = this.peerStreams.get(peerId);
     if (!stream || this.confirmedStreams.has(stream)) return;
     this.confirmedStreams.add(stream);
+    // The only proof anything can actually reach this peer - see
+    // confirmedStreams and streamProven's own doc for why connectedPeers
+    // alone was never enough.
+    this.emit("streamProven", peerId);
     const timer = this.confirmTimers.get(peerId);
     if (timer) {
       clearInterval(timer);
@@ -1164,15 +1484,15 @@ export class LibP2PTransport implements PeerTransport {
     const queued = this.pendingQueues.get(peerId) ?? [];
     this.pendingQueues.delete(peerId);
     for (const entry of queued) {
-      entry.resolve(this.writeFrame(peerId, stream, entry.data));
+      void this.writeFrame(peerId, stream, entry.data).then(entry.resolve);
     }
   }
 
-  private writeFrame(
+  private async writeFrame(
     peerId: string,
     stream: Stream,
     data: Uint8Array
-  ): boolean {
+  ): Promise<boolean> {
     if (!streamIsOpen(stream)) {
       this.cleanupPeerStream(peerId);
       return false;
@@ -1180,10 +1500,19 @@ export class LibP2PTransport implements PeerTransport {
     try {
       const ok = stream.send(encodeFrame(data));
       this.debugStats.framesOut++;
-      if (!ok) {
-        stream.onDrain().catch(() => this.cleanupPeerStream(peerId));
-      }
-      return true;
+      if (ok) return true;
+      // A false return means the frame is BUFFERED, not flushed. Resolving
+      // true here let send() report success for a frame that later dropped
+      // on backpressure - and the DM layer deletes a message from its
+      // persisted queue on true, so an optimistic true here destroyed it.
+      // Report the real outcome once the stream actually drains.
+      return await stream.onDrain().then(
+        () => true,
+        () => {
+          this.cleanupPeerStream(peerId);
+          return false;
+        }
+      );
     } catch (err) {
       console.warn(`[LibP2PTransport] write failed for ${peerId}:`, err);
       this.cleanupPeerStream(peerId);
@@ -1259,7 +1588,7 @@ export class LibP2PTransport implements PeerTransport {
             const reply = pongFrame(typeof live.n === "number" ? live.n : 0);
             const out = this.peerStreams.get(fromId);
             if (out && streamIsOpen(out)) {
-              this.writeFrame(fromId, out, reply);
+              void this.writeFrame(fromId, out, reply);
             } else {
               void this.send(fromId, reply);
             }
@@ -1267,6 +1596,16 @@ export class LibP2PTransport implements PeerTransport {
           }
           if (live?.type === "__pong") {
             this.debugStats.pongsIn++;
+            if (typeof live.n === "number") {
+              const probe = this.rttProbes.get(live.n);
+              if (probe) {
+                this.rttProbes.delete(live.n);
+                // Timed on this side only. Subtracting timestamps taken on
+                // two machines would measure their clock disagreement, which
+                // is unbounded, not the round trip.
+                probe.settle(performance.now() - probe.sentAt);
+              }
+            }
             // Confirm only when the echoed nonce belongs to the current
             // stream's pings.
             if (
@@ -1294,11 +1633,13 @@ export class LibP2PTransport implements PeerTransport {
     const stream = this.peerStreams.get(peerId);
     if (!stream) return;
     this.debugStats.outboundResets++;
+    const wasProven = this.confirmedStreams.has(stream);
     this.peerStreams.delete(peerId);
     this.confirmNonces.delete(peerId);
     try {
       stream.abort(new Error("peer reopened its stream"));
     } catch {}
+    if (wasProven) this.emit("streamLost", peerId);
     // Anything already queued has no other trigger to reopen the stream, and
     // the silence probe only fires after PEER_SILENCE_MS - so without this the
     // frames would just sit there for at least that long.
@@ -1316,8 +1657,13 @@ export class LibP2PTransport implements PeerTransport {
     }
     const stream = this.peerStreams.get(peerId);
     if (stream) {
+      // Withdraw proof only if this stream actually held it - most callers
+      // tear down a stream that never confirmed, and announcing a loss that
+      // was never a gain would just be noise.
+      const wasProven = this.confirmedStreams.has(stream);
       stream.abort(new Error("cleanup"));
       this.peerStreams.delete(peerId);
+      if (wasProven) this.emit("streamLost", peerId);
     }
     this.failPendingQueue(peerId);
     this.openingStreams.delete(peerId);
@@ -1325,6 +1671,8 @@ export class LibP2PTransport implements PeerTransport {
 
   private async startRendezvous(): Promise<void> {
     if (this.intentionalDisconnect || !this.node || !this.relayPeerId) return;
+    if (this.rendezvousStarting) return;
+    this.rendezvousStarting = true;
 
     const selfId = this.node.peerId.toString();
 
@@ -1336,6 +1684,7 @@ export class LibP2PTransport implements PeerTransport {
         { runOnLimitedConnection: true }
       );
     } catch (err) {
+      this.rendezvousStarting = false;
       console.warn("[Rendezvous] failed to open stream, retrying:", err);
       this.emit("status", {
         type: "rendezvous-failed",
@@ -1345,8 +1694,19 @@ export class LibP2PTransport implements PeerTransport {
       return;
     }
 
+    // Take the reference first, then retire the old stream. The close handler
+    // below bails out when it is no longer the current stream, so aborting
+    // before the assignment would make the outgoing stream wipe its own
+    // replacement and schedule a needless reconnect.
+    const previous = this.rendezvousStream;
     this.rendezvousStream = stream;
     this.rendezvousReadBuf = new Uint8Array(0);
+    this.rendezvousStarting = false;
+    if (previous && previous !== stream) {
+      previous.abort(new Error("rendezvous stream superseded"));
+    }
+
+    this.startRendezvousPing(stream);
 
     // re-register all rooms after rendezvous reconnect
     for (const room of this.joinedRooms) {
@@ -1387,7 +1747,24 @@ export class LibP2PTransport implements PeerTransport {
             FRAME_DECODER.decode(payload)
           ) as RendezvousServerMsg;
           this.handleRendezvousMsg(selfId, msg);
-        } catch {}
+        } catch (err) {
+          // Swallowing this lost the frame with no signal and no reconnect.
+          // The liveness ping keeps answering the relay, so the relay never
+          // notices that this stream's read side is dead. Abort instead, the
+          // way the oversized-frame branch above already does, and let the
+          // close handler reconnect.
+          console.warn(
+            "[Rendezvous] failed to process frame, aborting stream:",
+            err
+          );
+          this.rendezvousReadBuf = new Uint8Array(0);
+          stream.abort(
+            err instanceof Error
+              ? err
+              : new Error("rendezvous frame processing failed")
+          );
+          return;
+        }
       }
     });
 
@@ -1399,6 +1776,7 @@ export class LibP2PTransport implements PeerTransport {
       // then silently no-opped, so a leaveRoom UNREGISTER was lost with no
       // retry and the relay kept telling peers we were still in the room.
       if (this.rendezvousStream !== stream) return;
+      this.stopRendezvousPing();
       this.rendezvousStream = null;
       if (!this.intentionalDisconnect && this.node) {
         console.warn("[Rendezvous] stream closed, reconnecting");
@@ -1409,6 +1787,30 @@ export class LibP2PTransport implements PeerTransport {
         setTimeout(() => this.startRendezvous(), RENDEZVOUS_RECONNECT_DELAY_MS);
       }
     });
+  }
+
+  /**
+   * Prove to the relay that a registered stream is still alive. The relay
+   * gives a registered stream no read deadline of its own beyond three
+   * missed intervals, so a peer whose network vanished without a TCP close
+   * stayed advertised in its rooms and every other member kept dialling a
+   * peer that was not there.
+   */
+  private startRendezvousPing(stream: Stream): void {
+    this.stopRendezvousPing();
+    this.rendezvousPingTimer = setInterval(() => {
+      if (this.rendezvousStream !== stream) {
+        this.stopRendezvousPing();
+        return;
+      }
+      this.rendezvousSend({ type: "PING" });
+    }, RENDEZVOUS_PING_INTERVAL_MS);
+  }
+
+  private stopRendezvousPing(): void {
+    if (this.rendezvousPingTimer === null) return;
+    clearInterval(this.rendezvousPingTimer);
+    this.rendezvousPingTimer = null;
   }
 
   private rendezvousSend(msg: RendezvousClientMsg): void {
@@ -1447,11 +1849,15 @@ export class LibP2PTransport implements PeerTransport {
         await this.node.dial(withoutWebRTC);
       } catch (err) {
         // ponytail: 3 attempts with linear backoff; enough for transient
-        // reservation races without hammering an offline peer
+        // reservation races without hammering an offline peer. Jittered
+        // like the relay dial - both sides of a pair learn about each
+        // other from the same rendezvous reply and would otherwise retry
+        // in lockstep and lose the same reservation race every time.
         if (attempt < 2 && !this.intentionalDisconnect) {
+          const wait = PEER_REDIAL_DELAY_MS * (attempt + 1);
           setTimeout(
             () => this.dialPeer(peerId, attempt + 1).catch(() => {}),
-            PEER_REDIAL_DELAY_MS * (attempt + 1)
+            wait + Math.random() * wait * 0.3
           );
           return;
         }
@@ -1464,7 +1870,7 @@ export class LibP2PTransport implements PeerTransport {
           );
           this.emit("status", {
             type: "peer-dial-failed",
-            peerId: peerId.slice(-8),
+            peerId,
             message: `Could not reach peer ${peerId.slice(-8)}`,
           });
         }
@@ -1483,12 +1889,20 @@ export class LibP2PTransport implements PeerTransport {
           if (this.connectedPeers.has(peerId)) continue;
           this.dialPeer(peerId).catch(() => {});
         }
+        // Peers we were ALREADY connected to fire no connect event, so
+        // without this nothing would reconcile history with them until the
+        // repair tick came round - digests are gated on membership, and this
+        // reply is where membership becomes known.
+        this.emit("roomPeers", msg.room, this.peersInRoom(msg.room));
         break;
       }
       case "PEER_JOINED": {
         const peerId = msg.peer;
         if (peerId === selfId) break;
         this.rememberRoomPeer(msg.room, peerId);
+        if (this.connectedPeers.has(peerId)) {
+          this.emit("roomPeers", msg.room, [peerId]);
+        }
         if (this.connectedPeers.has(peerId)) break;
         this.dialPeer(peerId).catch(() => {});
         break;
@@ -1502,27 +1916,33 @@ export class LibP2PTransport implements PeerTransport {
     }
   }
 
-  private waitForRelayReservation(): Promise<void> {
+  /** Resolves true once the circuit reservation is live, false on timeout. */
+  private waitForRelayReservation(): Promise<boolean> {
     return new Promise((resolve) => {
-      if (!this.node) return resolve();
-      const ownId = this.node.peerId.toString();
+      // Captured once: a reconnect landing mid-wait replaces this.node, and
+      // removing the listener from the NEW node left it attached to the OLD
+      // one forever - and a late fire on the old node's closure could read
+      // the new node's addresses and resolve THIS promise from them.
+      const node = this.node;
+      if (!node) return resolve(false);
+      const ownId = node.peerId.toString();
 
       const deadline = setTimeout(() => {
         console.warn(
           "[Transport] relay reservation timed out, addrs:",
-          this.node?.getMultiaddrs().map((a) => a.toString())
+          node.getMultiaddrs().map((a) => a.toString())
         );
-        this.node?.removeEventListener("self:peer:update", check);
+        node.removeEventListener("self:peer:update", check);
 
         this.emit("status", {
           type: "reservation-timeout",
           message: "Relay reservation timed out - you may not be reachable",
         });
-        resolve();
+        resolve(false);
       }, RELAY_RESERVATION_TIMEOUT_MS);
 
       const check = () => {
-        const addrs = this.node?.getMultiaddrs() ?? [];
+        const addrs = node.getMultiaddrs();
         const circuit = addrs.find((ma) => {
           const s = ma.toString();
           return s.includes("/p2p-circuit") && s.endsWith(`/p2p/${ownId}`);
@@ -1530,24 +1950,30 @@ export class LibP2PTransport implements PeerTransport {
         if (circuit) {
           console.log("[Transport] relay reservation ok:", circuit.toString());
           clearTimeout(deadline);
-          this.node?.removeEventListener("self:peer:update", check);
-          resolve();
+          node.removeEventListener("self:peer:update", check);
+          resolve(true);
         }
       };
 
-      this.node.addEventListener("self:peer:update", check);
+      node.addEventListener("self:peer:update", check);
       check();
     });
   }
 
-  private updateRelayedStatus(peerId: string): void {
+  private updateRelayedStatus(
+    peerId: string,
+    prefetched?: Connection[]
+  ): void {
     if (!this.node) return;
-    const pid = this.node.getPeers().find((p) => p.toString() === peerId);
-    // getConnections(undefined) returns EVERY connection in the node, relay
-    // included, which reads as "direct" and silently answers a question we
-    // cannot answer. A peer with no connections has no status.
-    if (pid == null) return;
-    const connections = this.node.getConnections(pid);
+    let connections = prefetched;
+    if (!connections) {
+      const pid = this.node.getPeers().find((p) => p.toString() === peerId);
+      // getConnections(undefined) returns EVERY connection in the node, relay
+      // included, which reads as "direct" and silently answers a question we
+      // cannot answer. A peer with no connections has no status.
+      if (pid == null) return;
+      connections = this.node.getConnections(pid);
+    }
     if (!connections?.length) return;
 
     // Not a substring test on the address. A direct WebRTC connection is
@@ -1560,8 +1986,10 @@ export class LibP2PTransport implements PeerTransport {
     // connection is built, so use its answer rather than a second, wrong one.
     const hasDirect = connections.some((c) => c.direct);
 
+    const was = this.relayedPeers.has(peerId);
     if (hasDirect) this.relayedPeers.delete(peerId);
     else this.relayedPeers.add(peerId);
+    if (was !== !hasDirect) this.emit("relayChanged", peerId, !hasDirect);
   }
 
   private async privateKeyFromRawKey(privateKeyBytes: Uint8Array) {

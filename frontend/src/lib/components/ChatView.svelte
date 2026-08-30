@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { tick } from "svelte";
+  import { onDestroy, tick } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
   import type { Message } from "$lib/transport/transport.svelte";
+  import type { ReplyTo } from "$lib/types/message";
   import { MessageType } from "$lib/types/message";
   import {
     LogOut,
@@ -22,6 +23,23 @@
     UserPlus,
     UserRoundMinus,
     Trash2,
+    Angry,
+    Annoyed,
+    Laugh,
+    Meh,
+    Frown,
+    Baby,
+    Dog,
+    Skull,
+    Ghost,
+    Cat,
+    Bot,
+    PartyPopper,
+    Heart,
+    Star,
+    ChessQueen,
+    ThumbsUp,
+    CornerUpLeft,
   } from "@lucide/svelte";
   import { Button } from "$lib/components/ui/button";
   import { Badge } from "$lib/components/ui/badge";
@@ -29,6 +47,8 @@
   import { Separator } from "$lib/components/ui/separator";
   import VoiceVideoCallView from "./VoiceVideoCallView.svelte";
   import MsgRender from "./MsgRender.svelte";
+  import LocalPluginCard from "./LocalPluginCard.svelte";
+  import { localPluginCards } from "$lib/plugins/local-cards.svelte";
   import GifPicker from "./GifPicker.svelte";
   import GifImage from "./GifImage.svelte";
   import EmojiPickerPopup from "./EmojiPickerPopup.svelte";
@@ -36,6 +56,7 @@
   import UserListSidebar from "./UserListSidebar.svelte";
   import { profileStore, loadProfile } from "$lib/profile.svelte";
   import { displayPrefs } from "$lib/display-prefs.svelte";
+  import { resolveChatFontStack } from "$lib/chat-font";
   import { nameEffectStyle } from "$lib/name-effect";
   import { viewportHeight } from "$lib/actions/viewport-height";
   import {
@@ -59,20 +80,28 @@
   import { formatReactorNames } from "$lib/reaction-names";
   import {
     addToPhonebook,
-    openDmConversation,
+    openDmPanel,
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
   import { joinCall } from "$lib/transport/call.svelte";
-  import { serialize, mentionsMe, segmentDraft } from "$lib/mentions";
+  import {
+    buildMentionCandidates,
+    mentionsMe,
+    segmentDraft,
+    serialize,
+  } from "$lib/mentions";
   import { makeHostApi } from "$lib/plugins/host";
   import PluginIcon from "$lib/plugins/PluginIcon.svelte";
   import UserProfileCard from "./UserProfileCard.svelte";
-  import { openSettings } from "$lib/ui-state.svelte";
+  import { openSettings, requestReturnToCall } from "$lib/ui-state.svelte";
   import { identityStore } from "$lib/identity/identity.svelte";
   import { getRegistry, getPlugin } from "$lib/plugins/registry";
   import { isPluginEnabled } from "$lib/plugins/prefs.svelte";
   import type { HostApi } from "$lib/plugins/api";
   import { seededRandom } from "$lib/utils";
+  import { getQuotableText } from "$lib/quote-helper";
+  import { createInvite, formatShortCode } from "$lib/invite";
+  import { formatRoomCode } from "$lib/room-code";
 
   $effect(() => {
     loadProfile();
@@ -115,6 +144,7 @@
 
   let {
     peers,
+    roomUsers,
     messages,
     inCall,
     callRoomCode,
@@ -155,12 +185,110 @@
   let reactionPickerFor = $state<string | null>(null);
   let reactionAnchor = $state<DOMRect | null>(null);
   let composerEmojiOpen = $state(false);
+  // Idle toy: each hover of the emoji button steps to the next icon, and it
+  // STAYS there until the next hover. Deliberately not persisted - a refresh
+  // starts back at Smile.
+  const emojiCycle = [
+    Smile,
+    Angry,
+    Annoyed,
+    Laugh,
+    Meh,
+    Frown,
+    Baby,
+    Dog,
+    Skull,
+    Ghost,
+    Cat,
+    Bot,
+    PartyPopper,
+    Heart,
+    Star,
+    ChessQueen,
+    ThumbsUp,
+  ];
+  let emojiCycleIdx = $state(0);
   let composerEmojiAnchor = $state<DOMRect | null>(null);
   let gifPickerOpen = $state(false);
   let hasMoreHistory = $state(true);
   let loadingMore = $state(false);
+
+  /**
+   * Is there anything older to fetch?
+   *
+   * hasMoreHistory alone is an optimistic guess - it starts true and only
+   * learns otherwise from a page request that comes back short, so a brand
+   * new room offered "Load older messages" the moment it held one message,
+   * with nothing behind it.
+   *
+   * historyCapped is the honest answer, taken where the page is actually
+   * read: did that read hit the cap? Counting the messages in hand instead
+   * looked equivalent and was not - the cap applies to sealed rows and
+   * undecryptable ones are dropped afterwards, so one bad row returns 49 of
+   * 50 and would have hidden the rest of the room's history behind a button
+   * that never rendered.
+   */
+  const canLoadOlder = $derived(
+    hasMoreHistory && transportState.historyCapped
+  );
   let activeMessageId = $state<string | null>(null);
   let stagedFiles = $state<File[]>([]);
+  // Names of files between "Enter pressed" and "message echoed" - hashing
+  // for seeding happens in that window and it is silent otherwise.
+  /**
+   * The message that is on its way but does not exist yet.
+   *
+   * A file only becomes a real message once it has been fingerprinted and
+   * hashed for seeding, which is seconds of nothing on a large one. This
+   * stands in for it, in the chat where the message will land, rather than
+   * as a line of text above the input describing what is happening
+   * elsewhere.
+   */
+  type SendingPreview = {
+    name: string;
+    size: number;
+    type: string;
+    /** Its own object URL - see beginSendingPreview. */
+    url: string | null;
+  };
+  let sendingPreviews = $state<SendingPreview[]>([]);
+  let sendingCaption = $state("");
+  /**
+   * Which send the preview on screen belongs to.
+   *
+   * Sends overlap. A slow one finishing used to clear the preview of a
+   * faster one started after it, revoking its object URLs on the way, and
+   * the second send was left with no indicator at all - which is the dead
+   * air this whole thing exists to remove.
+   */
+  let sendingToken = 0;
+
+  onDestroy(() => clearSendingPreview());
+
+  function beginSendingPreview(files: File[], caption: string): number {
+    clearSendingPreview();
+    sendingPreviews = files.map((file) => ({
+      name: file.name,
+      size: file.size,
+      type: file.type,
+      // A fresh URL, not the staged one: clearStagedFiles revokes those, and
+      // it runs the moment this send starts, well before it finishes.
+      url:
+        file.type.startsWith("image/") || file.type.startsWith("video/")
+          ? URL.createObjectURL(file)
+          : null,
+    }));
+    sendingCaption = caption;
+    return ++sendingToken;
+  }
+
+  /** Pass the token from beginSendingPreview to clear only your own send. */
+  function clearSendingPreview(token?: number) {
+    if (token !== undefined && token !== sendingToken) return;
+    for (const p of sendingPreviews) if (p.url) URL.revokeObjectURL(p.url);
+    sendingPreviews = [];
+    sendingCaption = "";
+  }
   let fileInputEl = $state<HTMLInputElement | null>(null);
   let dragOverlayActive = $state(false);
   let dragDepth = $state(0);
@@ -223,6 +351,9 @@
       (m) => RENDERABLE_TYPES.has(m.type) && m.roomCode === roomCode
     )
   );
+  const visibleLocalCards = $derived(
+    localPluginCards.entries.filter((entry) => entry.roomCode === roomCode)
+  );
 
   const messageById = $derived(new Map(visibleMessages.map((m) => [m.id, m])));
 
@@ -265,12 +396,7 @@
     // 50+ VISIBLE messages, and a page full of invisible rows (reactions,
     // plugin updates) kept the count below that forever: two weeks of
     // history with no way to scroll to it.
-    if (
-      scrollTop < 80 &&
-      initialScrollDone &&
-      hasMoreHistory &&
-      !loadingMore
-    ) {
+    if (scrollTop < 80 && initialScrollDone && canLoadOlder && !loadingMore) {
       void loadOlderPreservingScroll();
     }
   }
@@ -300,6 +426,9 @@
   // Scroll on new messages if autoScroll is enabled
   $effect(() => {
     visibleMessages.length;
+    // The in-flight message too: it is not in visibleMessages, so without
+    // this it appears below the fold and the send looks like it did nothing.
+    sendingPreviews.length;
     if (!initialScrollDone) return;
     if (autoScroll && messagesEl) {
       setTimeout(() => scrollToBottom(), 0);
@@ -394,15 +523,29 @@
    */
   const draftSegments = $derived(segmentDraft(draft, draftMentionMap));
 
+  /**
+   * `roomUsers` is DID-keyed and seeded on join from the persisted participant
+   * list, and `peerNames` is seeded from stored peer profiles, so an offline
+   * member is still mentionable by name. The selection rules live in
+   * `mentions.ts` because they are testable there and this file is not.
+   */
+  const mentionCandidates = $derived(
+    buildMentionCandidates({
+      roomUsers,
+      peers,
+      toDid: senderDid,
+      nameOf: (id) => peerNames.get(id),
+      selfIds: [identityStore.did ?? "", selfId(), myPeerId()],
+    }),
+  );
+
   const filteredMembersForMention = $derived.by(() => {
     if (!mentionPopupOpen) return [];
-    const self = selfId();
-    const mine = myPeerId();
     const lower = mentionPrefix.toLowerCase();
-    return peers
-      .filter((pid) => pid !== self && pid !== mine)
-      .map((pid) => ({ did: senderDid(pid), name: displayNameFor(pid) }))
-      .filter((m) => !lower || m.name.toLowerCase().includes(lower));
+    if (!lower) return mentionCandidates;
+    return mentionCandidates.filter((m) =>
+      m.name.toLowerCase().includes(lower),
+    );
   });
 
   function updateMentionState() {
@@ -537,17 +680,17 @@
     const wireText = serialize(text, draftMentionMap);
 
     if (stagedFiles.length > 0) {
+      const sendToken = beginSendingPreview(stagedFiles, wireText);
       sendFiles(stagedFiles, wireText, {
         replyTo: replyTarget
           ? {
               id: replyTarget.id,
               senderName: displayName(replyTarget),
-              content:
-                replyTarget.content.length > 160
-                  ? `${replyTarget.content.slice(0, 157)}...`
-                  : replyTarget.content,
+              content: getQuotableText(replyTarget),
             }
           : undefined,
+      }).finally(() => {
+        clearSendingPreview(sendToken);
       });
       clearStagedFiles();
     } else if (replyTarget) {
@@ -610,20 +753,47 @@
     }, 900);
   }
 
-  function handleGifSelect(url: string) {
-    sendMessage(url);
+  function sendOrReplyWithMessage(content: string): void {
+    // Send a message (text or URL) with reply context if set. Mirrors the
+    // reply branching logic from submit() so GIF selections preserve reply targets.
+    if (replyTarget) {
+      sendReply(content, replyTarget);
+    } else {
+      sendMessage(content);
+    }
+    // Clear reply state exactly as submit() does.
+    replyTargetId = null;
     autoScroll = true;
+  }
+
+  function handleGifSelect(url: string) {
+    sendOrReplyWithMessage(url);
   }
 
   function handleGifFileSelect(file: File) {
     // A saved uploaded gif re-enters as a fresh file send: re-seeded, and
     // inlined into the message when small enough.
-    sendFiles([file]).catch(() => {});
-    autoScroll = true;
+    const sendToken = beginSendingPreview([file], "");
+    sendFiles([file], "", {
+      replyTo: replyTarget
+        ? {
+            id: replyTarget.id,
+            senderName: displayName(replyTarget),
+            content: getQuotableText(replyTarget),
+          }
+        : undefined,
+    })
+      .catch(() => {})
+      .finally(() => {
+        clearSendingPreview(sendToken);
+        // Clear reply state exactly as submit() does.
+        replyTargetId = null;
+        autoScroll = true;
+      });
   }
 
   async function handleLoadMore() {
-    if (loadingMore || !hasMoreHistory || messages.length === 0) return;
+    if (loadingMore || !canLoadOlder || messages.length === 0) return;
     loadingMore = true;
     const oldest = messages[0].lamport;
     const more = await loadMoreMessages(oldest);
@@ -753,8 +923,32 @@
     void addFilesToStage(e.dataTransfer.files);
   }
 
+  let copyMenuOpen = $state(false);
+  // Header short code: minted for THIS room on first use and dropped on a
+  // room switch, since it aliases one room code.
+  let shortCode = $state<string | null>(null);
+  let shortCodeFor = $state<string | null>(null);
+  let shortCodeError = $state<string | null>(null);
+
   async function copyCode() {
+    copyMenuOpen = false;
     await navigator.clipboard.writeText(window.location.href);
+    copied = true;
+    setTimeout(() => (copied = false), 2000);
+  }
+
+  async function copyShortCode() {
+    copyMenuOpen = false;
+    shortCodeError = null;
+    if (shortCodeFor !== roomCode) shortCode = null;
+    try {
+      shortCode ??= (await createInvite(roomCode)).code;
+      shortCodeFor = roomCode;
+    } catch {
+      shortCodeError = "Relay not reachable";
+      return;
+    }
+    await navigator.clipboard.writeText(formatShortCode(shortCode));
     copied = true;
     setTimeout(() => (copied = false), 2000);
   }
@@ -975,6 +1169,13 @@
     if (messages.length > 0) markSeen().catch(() => {});
   });
 
+  // markSeen refuses to run while the page is hidden, so the room the user was
+  // parked on keeps its unread count in a background tab. Catch it up the
+  // moment they look again.
+  function markSeenOnReturn(): void {
+    if (document.visibilityState === "visible") markSeen().catch(() => {});
+  }
+
   function shouldShowHeader(current: Message, previous?: Message): boolean {
     if (!previous) return true;
     const a = senderDid(current.senderId) || current.senderId;
@@ -1055,6 +1256,20 @@
     return { g2: meta?.gradient2, g3: meta?.gradient3 };
   }
 
+  /** Shimmer state for the name effect, keyed like names. Respects showPeerNicknameColors. */
+  function senderShimmer(senderId: string): boolean | undefined {
+    if (!displayPrefs.showPeerNicknameColors) return undefined;
+    const did = senderDid(senderId);
+    return peerProfileMeta.get(did)?.nameShimmer ?? peerProfileMeta.get(senderId)?.nameShimmer;
+  }
+
+  /** Glow state for the name effect, keyed like names. Respects showPeerNicknameColors. */
+  function senderGlow(senderId: string): boolean | undefined {
+    if (!displayPrefs.showPeerNicknameColors) return undefined;
+    const did = senderDid(senderId);
+    return peerProfileMeta.get(did)?.nameGlow ?? peerProfileMeta.get(senderId)?.nameGlow;
+  }
+
   /** Tag chip, keyed like names. Deliberately NOT behind
    *  showPeerNicknameColors: the tag is content, like the name; the colors
    *  pref governs decoration of the name itself. */
@@ -1084,6 +1299,27 @@
 
   function displayName(msg: Message): string {
     return displayNameFor(msg.senderId, msg.senderName);
+  }
+
+  /** What a reply should QUOTE.
+   *
+   *  The reply snapshot travels unsigned: no canonical version covers
+   *  replyTo.senderName or replyTo.content, so any room member can take a
+   *  genuine signed message, rewrite the words it appears to be quoting, and
+   *  have it verify honestly - and because sync puts by id, their copy
+   *  overwrites the original on peers that already hold it. Whenever we hold
+   *  the quoted message ourselves, its own signed content is the truth and the
+   *  snapshot is ignored. The snapshot is still the fallback for a quote whose
+   *  target we never received. */
+  function quoted(r: ReplyTo): { name: string; content: string } {
+    const held = messageById.get(r.id);
+    if (held) {
+      // Use quotable text for held messages so image-only messages show
+      // [image] instead of empty content. Held message is the source of truth.
+      return { name: displayName(held), content: getQuotableText(held) };
+    }
+    // Snapshot from the wire is already built with quotable text
+    return { name: r.senderName, content: r.content };
   }
 
   function reactorNames(users: Set<string>): string {
@@ -1168,7 +1404,10 @@
     if (onOpenDm) {
       await onOpenDm(peerId);
     } else {
-      await openDmConversation(peerId);
+      // No host to switch the view for us, so the panel: openDmConversation
+      // only moves the transport, leaving this pane rendering the room it is
+      // still keyed to and the DM invisible.
+      await openDmPanel(peerId);
     }
     closeUserMenu();
   }
@@ -1192,6 +1431,26 @@
     transportState.chatMode === "dm" && !!transportState.activeDmPeerId
   );
 
+  // Desktop only: below sm there is no room for two columns, and the call
+  // stage would squeeze the messages to nothing.
+  const callBeside = $derived(displayPrefs.callChatBeside && !isMobile);
+
+  // The stored pref is a stack id or a custom family name; the resolver turns
+  // either into a complete CSS stack, and sanitises the custom case because the
+  // value lands in an inline style attribute.
+  const chatFontStack = $derived(
+    resolveChatFontStack(displayPrefs.chatFontFamily),
+  );
+  // Opening the user list widens the chat column instead of crushing the
+  // message text into what the w-60 aside leaves behind.
+  const chatColClass = $derived(
+    callBeside && showCallView
+      ? `shrink-0 border-l border-border ${
+          showUserList && !isDmChat ? "w-156" : "w-96"
+        }`
+      : "flex-1"
+  );
+
   const dmPeerInPhonebook = $derived.by(() => {
     const peerId = transportState.activeDmPeerId;
     if (!peerId) return false;
@@ -1210,19 +1469,33 @@
 </script>
 
 <svelte:window
-  onclick={closeUserMenu}
+  onclick={(e) => {
+    closeUserMenu();
+    if (copyMenuOpen && !(e.target as HTMLElement).closest("[data-copy-menu]"))
+      copyMenuOpen = false;
+  }}
   onkeydown={(e) => {
     if (e.key === "Escape") {
       closeUserMenu();
+      copyMenuOpen = false;
       reactionPickerFor = null;
       activeMessageId = null;
     }
   }}
 />
 
+<svelte:document onvisibilitychange={markSeenOnReturn} />
+
+<!--
+  The two chat font properties are declared here and consumed by the message
+  body. They are purpose-named on purpose: overriding Tailwind's `--font-mono`
+  instead would also retarget every shiki code block, because Preflight resolves
+  `code`/`pre`/`kbd`/`samp` from that token.
+-->
 <div
   use:viewportHeight
-  class="relative flex flex-col bg-background text-foreground font-mono overflow-hidden"
+  style="--chat-font-family: {chatFontStack}"
+  class="relative flex flex-col bg-background text-foreground font-(family-name:--chat-font-family) overflow-hidden"
   role="main"
   ondragenter={handleRootDragEnter}
   ondragover={handleRootDragOver}
@@ -1256,7 +1529,9 @@
             <Menu class="size-4" />
           </Button>
         {/if}
-        <h1 class="text-sm font-semibold truncate text-foreground">
+        <!-- select-text, against the heading rule in app.css: a room name is
+             something people copy and paste to each other, not a label. -->
+        <h1 class="select-text text-sm font-semibold truncate text-foreground">
           {roomName || roomCode}
         </h1>
         {#if !isDmChat}
@@ -1271,24 +1546,60 @@
       </div>
       <div class="flex items-center gap-2 shrink-0">
         {#if !isDmChat}
-          <Tip text={copied ? "Copied" : "Copy room code"}>
-            {#snippet children(props)}
-          <button
-            {...props}
-            type="button"
-            onclick={copyCode}
-            aria-label="Copy room code"
-            class="hidden sm:flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs font-mono text-muted-foreground hover:text-foreground transition-colors"
-          >
-            <code>{roomCode}</code>
-            {#if copied}
-              <Check class="size-3 text-primary" />
-            {:else}
-              <Copy class="size-3 mb-0.5" />
+          <div class="relative hidden sm:block" data-copy-menu>
+            <Tip text={copied ? "Copied" : "Copy invite"}>
+              {#snippet children(props)}
+            <button
+              {...props}
+              type="button"
+              onclick={() => (copyMenuOpen = !copyMenuOpen)}
+              aria-label="Copy invite"
+              aria-haspopup="menu"
+              aria-expanded={copyMenuOpen}
+              class="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-xs font-mono text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <code>{formatRoomCode(roomCode)}</code>
+              {#if copied}
+                <Check class="size-3 text-primary" />
+              {:else}
+                <Copy class="size-3 mb-0.5" />
+              {/if}
+            </button>
+              {/snippet}
+            </Tip>
+            {#if copyMenuOpen}
+              <div
+                role="menu"
+                class="absolute right-0 top-full mt-2 z-20 w-56 rounded-lg border border-border bg-popover text-popover-foreground shadow-md p-1"
+              >
+                <button
+                  type="button"
+                  role="menuitem"
+                  onclick={copyCode}
+                  class="w-full text-left rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer"
+                >
+                  Copy link
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onclick={copyShortCode}
+                  class="w-full text-left rounded-md px-2 py-1.5 text-sm hover:bg-muted cursor-pointer"
+                >
+                  Copy short code
+                  <span class="block text-xs text-muted-foreground">
+                    {#if shortCode && shortCodeFor === roomCode}
+                      {formatShortCode(shortCode)} - works for 5 minutes
+                    {:else if shortCodeError}
+                      {shortCodeError}
+                    {:else}
+                      Works for 5 minutes
+                    {/if}
+                  </span>
+                </button>
+              </div>
             {/if}
-          </button>
-            {/snippet}
-          </Tip>
+          </div>
         {/if}
         {#if !inCall}
           <Tip text="Join call">
@@ -1298,12 +1609,39 @@
                 variant="ghost"
                 size="icon"
                 onclick={joinCall}
-                disabled={transportState.connecting}
+                disabled={transportState.connecting || transportState.joiningCall}
+                aria-busy={transportState.joiningCall}
                 aria-label="Join call"
-                class="text-muted-foreground hover:text-foreground cursor-pointer"
+                class="text-muted-foreground hover:text-foreground cursor-pointer {transportState.joiningCall
+                  ? 'animate-pulse'
+                  : ''}"
               >
                 <Phone class="size-4" />
               </Button>
+            {/snippet}
+          </Tip>
+        {:else if callRoomCode && callRoomCode !== roomCode}
+          <!--
+            The call is live in another conversation and its stage is not on
+            screen. The sidebar chip also leads back, but below sm the sidebar
+            is off-canvas - so the way back has to exist here too, and this slot
+            is empty in exactly this state.
+          -->
+          <Tip text="Back to the call you are in">
+            {#snippet children(props)}
+              <button
+                {...props}
+                type="button"
+                onclick={requestReturnToCall}
+                aria-label="Back to call"
+                class="flex items-center gap-1.5 rounded-full border border-green-500/20 bg-green-500/10 px-2 py-1 text-xs font-mono text-green-400 hover:brightness-125 cursor-pointer"
+              >
+                <span
+                  class="size-1.5 rounded-full bg-green-400 animate-pulse"
+                ></span>
+                <CornerUpLeft class="size-3.5" />
+                <span class="hidden sm:inline">Back to call</span>
+              </button>
             {/snippet}
           </Tip>
         {/if}
@@ -1387,10 +1725,6 @@
     </div>
   </header>
 
-  {#if showCallView}
-    <VoiceVideoCallView />
-  {/if}
-
   {#if connecting}
     <div
       class="absolute inset-0 bg-background/80 backdrop-blur-sm z-50 flex items-center justify-center"
@@ -1404,13 +1738,37 @@
     </div>
   {/if}
 
+  <!-- Call and chat. Stacked by default, side by side when callBeside. The
+       wrapper is always mounted: a remount would rebind messagesEl and drop
+       the scroll position on every switch. -->
+  <div
+    class="flex flex-1 min-h-0 overflow-hidden {callBeside
+      ? 'flex-row'
+      : 'flex-col'}"
+  >
+    {#if showCallView}
+      <!-- Own column: the call view also renders an error banner, which must
+           not become a second column of the row. -->
+      <div
+        class="flex min-h-0 flex-col {callBeside
+          ? 'min-w-0 flex-1'
+          : 'shrink-0'}"
+      >
+        <VoiceVideoCallView beside={callBeside} />
+      </div>
+    {/if}
+    <div
+      class="flex min-h-0 min-w-0 flex-col overflow-hidden {chatColClass}"
+    >
+
   <div class="flex flex-1 min-h-0 overflow-hidden">
     <div
       bind:this={messagesEl}
       onscroll={handleScroll}
+      style="--chat-font-size: {displayPrefs.chatFontSize}px"
       class="chat-messages flex-1 overflow-y-auto overflow-x-hidden px-4 py-2 min-h-0"
     >
-      {#if hasMoreHistory && visibleMessages.length > 0}
+      {#if canLoadOlder && visibleMessages.length > 0}
         <div class="flex justify-center py-2">
           <Button
             variant="ghost"
@@ -1425,9 +1783,9 @@
         </div>
       {/if}
 
-      {#if visibleMessages.length === 0}
+      {#if visibleMessages.length === 0 && visibleLocalCards.length === 0}
         <div class="flex h-full items-center justify-center py-20">
-          <p class="text-sm text-muted-foreground italic">
+          <p class="select-none text-sm text-muted-foreground italic">
             No messages yet. Say something!
           </p>
         </div>
@@ -1483,6 +1841,7 @@
                   : ""}
               >
                 {#if msg.replyTo}
+                  {@const q = quoted(msg.replyTo)}
                   <button
                     type="button"
                     class="ml-9 mb-0.5 max-w-md text-left inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-muted-foreground/90 hover:text-foreground cursor-pointer"
@@ -1492,10 +1851,10 @@
                       size="16"
                       class="text-muted-foreground -ml-5 transform -scale-x-100"
                     />
-                    <span class="font-semibold">{msg.replyTo.senderName}</span>
+                    <span class="font-semibold">{q.name}</span>
                     <span class="truncate"
                       >{humanizeMentions(
-                        msg.replyTo.content,
+                        q.content,
                         resolveMentionDisplayName
                       )}</span
                     >
@@ -1550,9 +1909,9 @@
                         {initials(msg)}
                       {/if}
                     </div>
-                    <div class="flex items-baseline gap-2">
+                    <div class="flex min-w-0 items-baseline gap-2">
                       {#if isOwn}
-                        {@const effectStyle = nameEffectStyle(profileStore.nameEffect, profileStore.color, profileStore.gradient2 ?? undefined, profileStore.gradient3 ?? undefined)}
+                        {@const effectStyle = nameEffectStyle(profileStore.nameEffect, profileStore.color, profileStore.gradient2 ?? undefined, profileStore.gradient3 ?? undefined, profileStore.nameShimmer, profileStore.nameGlow)}
                         <span
                           role="button"
                           tabindex="0"
@@ -1560,7 +1919,7 @@
                           onkeydown={(e) => {
                             if (e.key === "Enter") openProfileFromMessage(msg);
                           }}
-                          class="cursor-pointer text-sm font-medium text-primary {displayPrefs.italicOwnName
+                          class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-primary {displayPrefs.italicOwnName
                             ? 'italic'
                             : ''} {effectStyle.class}"
                           style={effectStyle.style || (profileStore.color ? `color: ${profileStore.color}` : "")}
@@ -1578,7 +1937,9 @@
                         {@const color = senderColor(msg.senderId)}
                         {@const effect = senderEffect(msg.senderId)}
                         {@const grads = senderGradients(msg.senderId)}
-                        {@const effectStyle = nameEffectStyle(effect, color, grads.g2, grads.g3)}
+                        {@const shimmer = senderShimmer(msg.senderId)}
+                        {@const glow = senderGlow(msg.senderId)}
+                        {@const effectStyle = nameEffectStyle(effect, color, grads.g2, grads.g3, shimmer, glow)}
                         <span
                           role="button"
                           tabindex="0"
@@ -1590,7 +1951,7 @@
                           onkeydown={(e) => {
                             if (e.key === "Enter") openProfileFromMessage(msg);
                           }}
-                          class="cursor-pointer text-sm font-medium text-foreground {effectStyle.class}"
+                          class="max-w-72 truncate cursor-pointer text-(length:--chat-font-size) font-medium text-foreground {effectStyle.class}"
                           style={effectStyle.style || (color ? `color: ${color}` : "")}
                         >
                           {displayName(msg)}
@@ -1710,6 +2071,66 @@
               </div>
             </div>
           {/each}
+
+          {#each visibleLocalCards as entry (entry.id)}
+            <LocalPluginCard {entry} />
+          {/each}
+
+          {#if sendingPreviews.length > 0}
+            <!-- The message before it exists. It sits where it will land and
+                 pulses until the real one replaces it, which is the whole
+                 point: a line of text above the input described the send
+                 happening somewhere else, and left the place it was going
+                 empty. -->
+            <div class="mb-3 flex flex-col items-end gap-1">
+              <div
+                class="flex max-w-[85%] animate-pulse flex-col gap-1.5 rounded-lg bg-primary/10 p-2"
+                aria-live="polite"
+                aria-label="Sending"
+              >
+                {#each sendingPreviews as p, i (i)}
+                  {#if p.url && p.type.startsWith("image/")}
+                    <img
+                      src={p.url}
+                      alt={p.name}
+                      class="max-h-56 max-w-xs rounded-md object-contain"
+                    />
+                  {:else if p.url && p.type.startsWith("video/")}
+                    <!-- svelte-ignore a11y_media_has_caption -->
+                    <video
+                      src={p.url}
+                      class="max-h-56 max-w-xs rounded-md"
+                      muted
+                      playsinline
+                    ></video>
+                  {:else}
+                    <div
+                      class="flex items-center gap-2 rounded bg-muted/60 px-2 py-1.5"
+                    >
+                      <FileText class="size-4 shrink-0 text-muted-foreground" />
+                      <div class="min-w-0">
+                        <p class="truncate text-xs text-foreground">{p.name}</p>
+                        <p class="text-[10px] text-muted-foreground">
+                          {formatSize(p.size)}
+                        </p>
+                      </div>
+                    </div>
+                  {/if}
+                {/each}
+                {#if sendingCaption}
+                  <p class="whitespace-pre-wrap break-words text-sm">
+                    {humanizeMentions(
+                      sendingCaption,
+                      resolveMentionDisplayName
+                    )}
+                  </p>
+                {/if}
+              </div>
+              <span class="font-mono text-[10px] text-muted-foreground">
+                Sending...
+              </span>
+            </div>
+          {/if}
         </div>
       {/if}
     </div>
@@ -1757,7 +2178,7 @@
           >
           <span class="mx-1">•</span>
           <span class="truncate"
-            >{humanizeMentions(replyTarget.content, resolveMentionDisplayName)}</span
+            >{humanizeMentions(getQuotableText(replyTarget), resolveMentionDisplayName)}</span
           >
         </div>
         <Tip text="Cancel reply (Esc)">
@@ -1778,8 +2199,13 @@
   {/if}
 
   {#if stagedFiles.length > 0}
-    <div class="border-t border-border bg-muted/30 px-4 py-2">
-      <div class="flex gap-2 overflow-x-auto pb-1">
+    <div
+      class="flex items-start gap-2 border-t border-border bg-muted/30 px-4 py-2"
+    >
+      <!-- pt-2/pr-2 inside the scroll area: the per-file delete badge hangs
+           past the tile's top-right corner, and the overflow container was
+           cropping it. -->
+      <div class="flex min-w-0 flex-1 gap-2 overflow-x-auto pb-1 pr-2 pt-2">
         {#each stagedFiles as file (fileKey(file))}
           {@const previewUrl = getStagedPreviewURL(file)}
           <div
@@ -1827,6 +2253,20 @@
           </div>
         {/each}
       </div>
+      <!-- Same way out the reply banner has: one X clears everything staged. -->
+      <Tip text="Remove attachments (Esc)">
+        {#snippet children(props)}
+          <button
+            {...props}
+            type="button"
+            class="self-center size-6 shrink-0 inline-flex items-center justify-center rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 cursor-pointer"
+            onclick={clearStagedFiles}
+            aria-label="Remove all attachments"
+          >
+            <X class="size-4" />
+          </button>
+        {/snippet}
+      </Tip>
     </div>
   {/if}
 
@@ -1904,6 +2344,13 @@
               >
                 <span class="text-muted-foreground">@</span>
                 <span class="truncate">{member.name}</span>
+                {#if !member.online}
+                  <!-- Say so rather than hiding them: mentioning an away member
+                       is the point, and a silent list looks like a bug. -->
+                  <span class="ml-auto shrink-0 text-[10px] text-muted-foreground">
+                    away
+                  </span>
+                {/if}
               </button>
             {/each}
           </div>
@@ -1941,8 +2388,11 @@
                 }}
                 aria-label="Insert emoji"
                 class="size-8 shrink-0 text-muted-foreground hover:text-foreground cursor-pointer"
+                onpointerenter={() =>
+                  (emojiCycleIdx = (emojiCycleIdx + 1) % emojiCycle.length)}
               >
-                <Smile class="size-4" />
+                {@const CycleIcon = emojiCycle[emojiCycleIdx]}
+                <CycleIcon class="size-4" />
               </Button>
             {/snippet}
           </Tip>
@@ -1973,6 +2423,8 @@
         <Send class="size-4" />
       </Button>
     </form>
+  </div>
+    </div>
   </div>
 </div>
 
