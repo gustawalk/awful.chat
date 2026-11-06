@@ -11,8 +11,20 @@ export interface ValidatedProfileMeta {
   gradient3?: string;
   bio?: string;
   nameEffect?: string;
+  nameShimmer?: boolean;
+  nameGlow?: boolean;
   bannerUrl?: string;
 }
+
+/**
+ * Base64 raster image only, the same allowlist normalizeAvatarUrl applies to
+ * avatars. A bare `data:image/` prefix test also let `data:image/svg+xml`
+ * through, and SVG can carry script and external references - harmless while
+ * both banner call sites are <img>, which neuters it, but the policy must not
+ * depend on every future call site remembering that.
+ */
+const DATA_BANNER_RE =
+  /^data:image\/(png|jpeg|jpg|gif|webp|avif);base64,[A-Za-z0-9+/]+=*$/;
 
 /**
  * Validate and sanitize profile metadata from wire or settings.
@@ -67,11 +79,22 @@ export function validateProfileMeta(meta: Partial<ValidatedProfileMeta>): Valida
     result.nameEffect = meta.nameEffect;
   }
 
-  // Banner URL: data:image only, max 1.5 MB string length
+  // Name shimmer: must be boolean if present
+  if (typeof meta.nameShimmer === "boolean") {
+    result.nameShimmer = meta.nameShimmer;
+  }
+
+  // Name glow: must be boolean if present
+  if (typeof meta.nameGlow === "boolean") {
+    result.nameGlow = meta.nameGlow;
+  }
+
+  // Banner URL: base64 raster data: image only, max 1.5 MB string length.
+  // The length test runs first so a 1.5 MB string is never handed to the regex.
   if (typeof meta.bannerUrl === "string") {
     if (
-      meta.bannerUrl.startsWith("data:image/") &&
-      meta.bannerUrl.length <= 1_500_000
+      meta.bannerUrl.length <= 1_500_000 &&
+      DATA_BANNER_RE.test(meta.bannerUrl)
     ) {
       result.bannerUrl = meta.bannerUrl;
     }

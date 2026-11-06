@@ -1,11 +1,13 @@
 <script lang="ts">
   import { createInfiniteQuery } from "@tanstack/svelte-query";
-  import { X, Upload, Search, Link } from "@lucide/svelte";
+  import { X, Upload, Search, Link, Crop } from "@lucide/svelte";
   import { Dialog as DialogPrimitive } from "bits-ui";
   import Button from "$lib/components/ui/button/button.svelte";
   import Input from "$lib/components/ui/input/input.svelte";
   import { Drawer, DrawerContent } from "$lib/components/ui/drawer";
   import { saveAvatar, saveBanner, profileStore } from "$lib/profile.svelte";
+  import ImageCropper from "$lib/components/ImageCropper.svelte";
+  import { cropImageToDataUrl, type CropView, type CropTarget } from "$lib/crop";
   import {
     searchGifs,
     getTrendingGifs,
@@ -22,6 +24,7 @@
 
   let { open, onClose, target = "avatar" }: Props = $props();
   const isBanner = $derived(target === "banner");
+  const dialogTitle = $derived(isBanner ? "Set banner" : "Set profile picture");
 
   type Tab = "upload" | "klipy" | "url";
   let activeTab = $state<Tab>("klipy");
@@ -29,6 +32,43 @@
   let error = $state<string | undefined>(undefined);
 
   const MAX_AVATAR_BYTES = $derived(isBanner ? 1_000_000 : 512 * 1024);
+
+  // Crop editor state. The output aspect and the byte budget differ per target:
+  // a square avatar shown as a circle, a 7:3 banner matching the card layout
+  // (max-w-md by h-48, so 448x192 on screen; 840x360 is that at 2x for a
+  // retina display).
+  //
+  // maxBytes is NOT a quality dial and must not be raised to buy sharpness.
+  // The banner is base64-inlined into the Profile message that _sendProfile
+  // gossipsub-publishes to every peer in the room, and base64 inflates by 4/3:
+  // 700_000 bytes becomes ~933 KB on the wire, which is what leaves headroom
+  // under a 1 MiB publish limit for the rest of the profile. Spend extra
+  // pixels instead - the GIF encoder in crop.ts already walks a scale ladder
+  // (1, 0.8, 0.6, 0.45) until the encode fits, so a heavy animated banner
+  // degrades in resolution rather than failing to reach anyone.
+  const cropTarget = $derived<CropTarget & { aspect: number; circle: boolean }>(
+    isBanner
+      ? { outWidth: 840, outHeight: 360, maxBytes: 700_000, aspect: 7 / 3, circle: false }
+      : { outWidth: 256, outHeight: 256, maxBytes: 400_000, aspect: 1, circle: true }
+  );
+  let cropping = $state(false);
+  let cropBusy = $state(false);
+
+  async function applyCrop(view: CropView) {
+    if (!preview || cropBusy) return;
+    cropBusy = true;
+    error = undefined;
+    try {
+      preview = await cropImageToDataUrl(preview, view, cropTarget);
+      cropping = false;
+    } catch {
+      error =
+        "This image can't be cropped here. Try the Upload tab with a saved copy.";
+      cropping = false;
+    } finally {
+      cropBusy = false;
+    }
+  }
 
   $effect(() => {
     if (open) {
@@ -205,6 +245,8 @@
     searchQuery = "";
     debouncedQuery = "";
     activeTab = "upload";
+    cropping = false;
+    cropBusy = false;
     error = undefined;
     onClose();
   }
@@ -238,7 +280,7 @@
     class="flex items-center justify-between px-4 py-3 border-b border-border shrink-0"
   >
     <span class="text-sm font-semibold text-foreground font-mono"
-      >Set profile picture</span
+      >{dialogTitle}</span
     >
     <button
       type="button"
@@ -250,6 +292,19 @@
     </button>
   </div>
 
+  {#if cropping && preview}
+    <div class="h-[24rem]">
+      <ImageCropper
+        src={preview}
+        aspect={cropTarget.aspect}
+        circle={cropTarget.circle}
+        busy={cropBusy}
+        onCancel={() => (cropping = false)}
+        onApply={applyCrop}
+      />
+    </div>
+  {:else}
+
   <div class="flex justify-center pt-4 pb-2 shrink-0">
     <div class="relative group">
       <div
@@ -260,7 +315,7 @@
         {#if preview}
           <img
             src={preview}
-            alt="Avatar preview"
+            alt={isBanner ? "Banner preview" : "Avatar preview"}
             class="size-full object-cover"
           />
         {:else}
@@ -276,7 +331,7 @@
           onclick={() => {
             preview = undefined;
           }}
-          aria-label="Remove avatar"
+          aria-label={isBanner ? "Remove banner" : "Remove avatar"}
           class="absolute inset-0 rounded-full flex items-center justify-center bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity"
         >
           <X class="size-5 text-white" />
@@ -284,6 +339,20 @@
       {/if}
     </div>
   </div>
+
+  {#if preview}
+    <div class="flex justify-center pb-2 shrink-0">
+      <button
+        type="button"
+        onclick={() => (cropping = true)}
+        class="flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-mono text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+        aria-label="Adjust image positioning"
+      >
+        <Crop class="size-3.5" />
+        Adjust
+      </button>
+    </div>
+  {/if}
 
   <!-- Tabs -->
   <div class="flex px-4 gap-1 shrink-0 border-b border-border">
@@ -335,14 +404,14 @@
               Drop an image or click to browse
             </p>
             <p class="text-xs text-muted-foreground font-mono mt-1">
-              PNG, JPEG, GIF, WebP
+              PNG, JPEG, GIF, WebP, AVIF
             </p>
           </div>
         </button>
         <input
           bind:this={fileInput}
           type="file"
-          accept="image/png,image/jpeg,image/gif,image/webp"
+          accept="image/png,image/jpeg,image/gif,image/webp,image/avif"
           class="hidden"
           onchange={handleFileChange}
         />
@@ -448,6 +517,7 @@
     <Button size="sm" onclick={handleSave}
             disabled={saving}>Save</Button>
   </div>
+  {/if}
 {/snippet}
 
 {#if isMobile}

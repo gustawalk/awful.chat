@@ -10,7 +10,11 @@
   } from "$lib/transport/transport.svelte";
   import { looksLikePeerId } from "$lib/identity/identity-utils";
   import {
-    openDmConversation,
+    derivePeerOnlineState,
+    PEER_PROOF_GRACE_MS,
+  } from "$lib/peer-online-status";
+  import {
+    openDmPanel,
     addToPhonebook,
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
@@ -55,12 +59,15 @@
     avatarUrl: string | null;
     color: string | null;
     nameEffect: string | null;
+    nameShimmer: boolean | null;
+    nameGlow: boolean | null;
     gradient2: string | null;
     gradient3: string | null;
     tagText: string | null;
     tagTextColor: string | null;
     tagChipColor: string | null;
     isOnline: boolean;
+    isConnecting: boolean;
     isSelf: boolean;
     isRelayed: boolean;
     inCall: boolean;
@@ -82,6 +89,41 @@
     getRoomUsers();
   });
 
+  // When each currently-connected peer id was first observed, so the grace
+  // window below measures from the actual connect, not from whenever this
+  // component happened to re-render.
+  let connectedSince = $state(new Map<string, number>());
+  $effect(() => {
+    const nowTs = Date.now();
+    const next = new Map(connectedSince);
+    let changed = false;
+    for (const p of peers) {
+      if (!next.has(p)) {
+        next.set(p, nowTs);
+        changed = true;
+      }
+    }
+    for (const p of [...next.keys()]) {
+      if (!peers.includes(p)) {
+        next.delete(p);
+        changed = true;
+      }
+    }
+    if (changed) connectedSince = next;
+  });
+
+  // A connected-but-unproven peer must downgrade from "online" to
+  // "connecting" on its own once the grace window elapses, not only the
+  // next time some other reactive input happens to change - so this needs
+  // its own clock, not a derivation of state that only ticks on its own.
+  let now = $state(Date.now());
+  $effect(() => {
+    const tick = setInterval(() => {
+      now = Date.now();
+    }, 500);
+    return () => clearInterval(tick);
+  });
+
   const users = $derived.by(() => {
     const allUsers: User[] = [];
 
@@ -95,12 +137,29 @@
         connectedPeerId ??
         didToPeerId(did) ??
         (looksLikePeerId(did) ? did : null);
-      const directlyConnected = peers.includes(did);
-      const isOnline =
-        isSelf ||
-        !!connectedPeerId ||
-        directlyConnected ||
-        (!!mappedPeerId && peers.includes(mappedPeerId));
+      // Which member of `peers` (if any) is this user's connected id -
+      // libp2p's connectedPeers says nothing about whether a frame can
+      // reach them, so "connected" and "proven" are checked separately
+      // (libp2p-audit finding 1).
+      const onlinePeerId = connectedPeerId ??
+        (peers.includes(did)
+          ? did
+          : mappedPeerId && peers.includes(mappedPeerId)
+            ? mappedPeerId
+            : null);
+      const proven = !!onlinePeerId && transportState.provenPeers.has(onlinePeerId);
+      const connectedSinceMs = onlinePeerId
+        ? connectedSince.get(onlinePeerId)
+        : undefined;
+      const { isOnline, isConnecting } = isSelf
+        ? { isOnline: true, isConnecting: false }
+        : derivePeerOnlineState(
+            !!onlinePeerId,
+            proven,
+            connectedSinceMs,
+            now,
+            PEER_PROOF_GRACE_MS
+          );
       const relayedPeerId = connectedPeerId ?? mappedPeerId;
       const userIsRelayed =
         !!relayedPeerId && isOnline && isRelayed(relayedPeerId);
@@ -109,6 +168,8 @@
       let avatarUrl: string | null = null;
       let color: string | null = null;
       let nameEffect: string | null = null;
+      let nameShimmer: boolean | null = null;
+      let nameGlow: boolean | null = null;
       let gradient2: string | null = null;
       let gradient3: string | null = null;
       let tagText: string | null = null;
@@ -120,6 +181,8 @@
         avatarUrl = profileStore.avatarUrl || null;
         color = profileStore.color || null;
         nameEffect = profileStore.nameEffect || null;
+        nameShimmer = profileStore.nameShimmer ?? null;
+        nameGlow = profileStore.nameGlow ?? null;
         gradient2 = profileStore.gradient2 || null;
         gradient3 = profileStore.gradient3 || null;
         tagText = profileStore.tagText || null;
@@ -135,12 +198,14 @@
             ? peerColors.get(nameKey) || peerColors.get(did) || null
             : null;
         // Name effect: respect showPeerNicknameColors like color does
-        nameEffect = displayPrefs.showPeerNicknameColors
-          ? peerProfileMeta.get(nameKey)?.nameEffect || peerProfileMeta.get(did)?.nameEffect || null
-          : null;
+        const meta = peerProfileMeta.get(nameKey) ?? peerProfileMeta.get(did);
+        if (displayPrefs.showPeerNicknameColors) {
+          nameEffect = meta?.nameEffect || null;
+          nameShimmer = meta?.nameShimmer ?? null;
+          nameGlow = meta?.nameGlow ?? null;
+        }
         // The tag is content like the name, not decoration - it ignores the
         // colors pref.
-        const meta = peerProfileMeta.get(nameKey) ?? peerProfileMeta.get(did);
         gradient2 = meta?.gradient2 || null;
         gradient3 = meta?.gradient3 || null;
         tagText = meta?.tagText || null;
@@ -176,7 +241,10 @@
         avatarUrl,
         color,
         nameEffect,
+        nameShimmer,
+        nameGlow,
         isOnline,
+        isConnecting,
         isSelf,
         isRelayed: userIsRelayed,
         inCall,
@@ -194,6 +262,8 @@
       if (!a.isSelf && b.isSelf) return 1;
       if (a.isOnline && !b.isOnline) return -1;
       if (!a.isOnline && b.isOnline) return 1;
+      if (a.isConnecting && !b.isConnecting) return -1;
+      if (!a.isConnecting && b.isConnecting) return 1;
       return a.name.localeCompare(b.name);
     });
   });
@@ -278,7 +348,10 @@
     if (onOpenDm) {
       onOpenDm(peerId);
     } else {
-      await openDmConversation(peerId);
+      // No host to switch the view for us, so the panel: openDmConversation
+      // only moves the transport, leaving the pane rendering the room it is
+      // still keyed to and the DM invisible.
+      await openDmPanel(peerId);
     }
     closeUserMenu();
   }
@@ -335,12 +408,14 @@
       <div
         class="absolute -bottom-0.5 -right-0.5 size-3 rounded-full border-2 border-background {user.isOnline
           ? 'bg-green-500'
-          : 'bg-muted-foreground'}"
+          : user.isConnecting
+            ? 'bg-yellow-500'
+            : 'bg-muted-foreground'}"
       ></div>
     </div>
     <div class="min-w-0 flex-1">
       {#if true}
-        {@const effectStyle = nameEffectStyle(user.nameEffect ?? undefined, user.color ?? undefined, user.gradient2 ?? undefined, user.gradient3 ?? undefined)}
+        {@const effectStyle = nameEffectStyle(user.nameEffect ?? undefined, user.color ?? undefined, user.gradient2 ?? undefined, user.gradient3 ?? undefined, user.nameShimmer ?? undefined, user.nameGlow ?? undefined)}
         <div
           class="text-sm font-medium truncate {user.isSelf
             ? 'text-primary'
@@ -359,6 +434,8 @@
               style={`background-color: ${user.tagChipColor ?? "#e5e7eb"}; color: ${user.tagTextColor ?? "#000000"}`}
             >{user.tagText}</span>
           {/if}
+          <!-- Relayed badge: always shown, not gated on showConnectionInfo.
+               That setting controls only the floating panel on the right. -->
           {#if user.isRelayed}
             <Tip text={RELAY_TIP}>
               {#snippet children(props)}
@@ -384,7 +461,9 @@
             ? "In call"
             : user.isOnline
               ? "Online"
-              : "Offline"}
+              : user.isConnecting
+                ? "Connecting"
+                : "Offline"}
       </div>
     </div>
   </div>
@@ -393,7 +472,7 @@
 {#snippet SectionDivider(label: string, count: number, Icon?: typeof Users)}
   <!-- The icon slot is always reserved so every section's label and count
        start at the same x, icon or not - ragged headers read as misaligned. -->
-  <div class="flex items-center gap-2 px-3 py-1.5">
+  <div class="flex select-none items-center gap-2 px-3 py-1.5">
     {#if Icon}
       <Icon class="size-4 shrink-0 {label === 'In call'
           ? 'text-primary'
@@ -402,7 +481,7 @@
       <span class="size-4 shrink-0"></span>
     {/if}
     <span
-      class="text-xs font-semibold uppercase tracking-wider font-mono {label ===
+      class="select-none text-xs font-semibold uppercase tracking-wider font-mono {label ===
       'In call'
         ? 'text-primary'
         : 'text-muted-foreground'}">{label}</span
@@ -414,7 +493,7 @@
 {#snippet UserListContent()}
   <div class="p-2 space-y-1">
     {#if users.length === 0}
-      <div class="text-center py-8 text-sm text-muted-foreground">
+      <div class="select-none text-center py-8 text-sm text-muted-foreground">
         No users in this room
       </div>
     {:else}
@@ -466,10 +545,10 @@
     class="w-60 border-l border-border bg-background flex flex-col h-full shrink-0"
   >
     <div
-      class="flex h-13 shrink-0 items-center gap-2 border-b border-border px-3"
+      class="flex h-13 shrink-0 select-none items-center gap-2 border-b border-border px-3"
     >
       <Users class="size-4 text-muted-foreground" />
-      <span class="text-xs font-semibold uppercase tracking-wider font-mono"
+      <span class="select-none text-xs font-semibold uppercase tracking-wider font-mono"
         >Users</span
       >
       <Badge variant="secondary" class="text-muted-foreground"

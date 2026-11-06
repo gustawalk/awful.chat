@@ -26,6 +26,7 @@
     refreshPhonebook,
     refreshDmRooms,
   } from "$lib/rooms.svelte";
+  import { uiState } from "$lib/ui-state.svelte";
   import {
     getMessages,
     getLastMessage,
@@ -38,11 +39,13 @@
   } from "$lib/storage";
   import { MessageType } from "$lib/types/message";
   import { loadProfile } from "$lib/profile.svelte";
-import { displayPrefs } from "$lib/display-prefs.svelte";
+  import { displayPrefs, setSidebarCollapsed } from "$lib/display-prefs.svelte";
   import { consumeLatestSharedPayload } from "$lib/share-target";
   import { humanizeMentions } from "$lib/mentions";
   import ReloadPrompt from "./ReloadPrompt.svelte";
   import InstallPrompt from "./InstallPrompt.svelte";
+  import CommandPalette from "./palette/CommandPalette.svelte";
+  import type { PaletteHost } from "$lib/palette/host";
   import { Dialog } from "bits-ui";
   import { Notebook, Star, Trash2, Users, X } from "@lucide/svelte";
   import {
@@ -53,17 +56,43 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
   } from "$lib/components/ui/drawer";
   import {
     addToPhonebook,
+    closeDmPanel,
     dmConversationCodeFor,
     openDmConversation,
     removeDmConversation,
     removeFromPhonebook,
   } from "$lib/transport/dm.svelte";
+  import FloatingDmPanel from "$lib/components/FloatingDmPanel.svelte";
+  import CallPipPanel from "$lib/components/CallPipPanel.svelte";
+  import { normalizeRoomCode } from "$lib/room-code";
+  import { updateSpeakerTracks, stopAllSpeakers, resumeAudioContextOnVisibilityChange } from "$lib/speakers.svelte";
+  import { callFocus } from "$lib/call-focus.svelte";
+  import { speakers } from "$lib/speakers.svelte";
+  import { spotlight } from "$lib/spotlight";
+  import { callPipPanel } from "$lib/call-pip.svelte";
+  import type { SpotlightTile } from "$lib/spotlight";
+  import {
+    spotlightStore,
+    buildTilesWithTracking,
+    trackStartTimes,
+    createCanvasPlaceholder,
+    setPipSource,
+    enterBrowserPip,
+    exitBrowserPip,
+  } from "$lib/call-spotlight.svelte";
+  import type { CallState } from "$lib/call-tiles";
+  import { setOnPictureInPictureEnter } from "$lib/plugins/media-session";
 
   const queryClient = new QueryClient();
 
   function parseRoomCode(pathname: string): string | null {
     const m = pathname.match(/^\/r\/([^/]+)/);
-    return m ? m[1] : null;
+    if (!m) return null;
+    try {
+      return normalizeRoomCode(decodeURIComponent(m[1]));
+    } catch {
+      return normalizeRoomCode(m[1]);
+    }
   }
 
   /**
@@ -163,6 +192,46 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
     consumeSharedIfPresent().catch(() => {});
   });
 
+  // Speaker detection must run while in call, not just while the stage is mounted.
+  // The stage unmounts when the user navigates away from the call room, but speaker
+  // detection must continue for the floating panel to show who is speaking.
+  $effect(() => {
+    if (!transportState.inCall) {
+      stopAllSpeakers();
+      return;
+    }
+    // Update speaker tracks whenever call state changes.
+    // Convert null to undefined for type compatibility.
+    const participants = new Map(
+      Array.from(transportState.participants).map(([peerId, p]) => [
+        peerId,
+        {
+          audioTrack: p.audioTrack ?? undefined,
+          videoTrack: p.videoTrack ?? undefined,
+          screenTrack: p.screenTrack ?? undefined,
+          screenAudioTrack: p.screenAudioTrack ?? undefined,
+        },
+      ])
+    );
+    updateSpeakerTracks(
+      participants,
+      transportState.muted,
+      transportState.localMicStream,
+      selfId()
+    );
+  });
+
+  // Resume audio context when visibility changes (tab becomes active), and
+  // close the PiP window the tab switch opened: the call is on screen again.
+  if (typeof document !== "undefined") {
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && transportState.inCall) {
+        resumeAudioContextOnVisibilityChange();
+        if (callPipPanel.browserPip) void exitBrowserPip();
+      }
+    });
+  }
+
   let activeRoomCode = $state<string | null>(null);
   let activeRoomName = $state<string>("");
   let activeDmPeerId = $state<string | null>(null);
@@ -194,9 +263,14 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
 
   // Mirror everything unread onto the installed app icon and the tab title,
   // so a background tab shows "(3) Awful.chat" at a glance.
+  //
+  // Summed over the rooms that exist, not over every key in the map: summing
+  // the map wholesale meant any entry that was not a room inflated the title
+  // while the sidebar, which walks the room list, stayed right - and the two
+  // numbers disagreeing is the bug the reader actually notices.
   $effect(() => {
-    const rooms = [...roomsStore.unreadCounts.values()].reduce(
-      (sum, n) => sum + n,
+    const rooms = roomsStore.rooms.reduce(
+      (sum, room) => sum + (roomsStore.unreadCounts.get(room.roomCode) ?? 0),
       0
     );
     const total = rooms + dmUnreadTotal;
@@ -381,6 +455,40 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
     sidebarOpen = false;
   }
 
+  /**
+   * Take the user back to the call they are in. The call survives navigating
+   * away - only the stage unmounts, because it is gated on the conversation on
+   * screen being the call's - so getting back is pure navigation. Nothing is
+   * rejoined.
+   */
+  async function returnToCall(): Promise<void> {
+    const code = transportState.callRoomCode;
+    if (!code) return;
+    if (code.startsWith("dm-")) {
+      const peer = roomsStore.dmRooms.find(
+        (r) => r.roomCode === code
+      )?.participantDid;
+      if (peer) await handleSelectDm(peer);
+      return;
+    }
+    await handleSelectRoom(code);
+  }
+
+  $effect(() => {
+    if (!uiState.returnToCallRequested) return;
+    uiState.returnToCallRequested = false;
+    void returnToCall();
+  });
+
+  /**
+   * Promote the floating panel's conversation to the full DMs view. The panel
+   * closes: leaving it open over the same conversation would show it twice.
+   */
+  async function expandDmPanel(peerId: string): Promise<void> {
+    closeDmPanel();
+    await handleSelectDm(peerId);
+  }
+
   function dmTitleFor(peerId: string): string {
     const did = peerIdToDid(peerId);
     return (
@@ -487,6 +595,198 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
   function openCreateJoin() {
     createJoinOpen = true;
   }
+
+  let paletteOpen = $state(false);
+
+  // Anything outside this tree asks for the palette through uiState, the same
+  // way it asks for the settings dialog.
+  $effect(() => {
+    if (!uiState.paletteOpenRequested) return;
+    uiState.paletteOpenRequested = false;
+    if (identityStore.isUnlocked) paletteOpen = true;
+  });
+
+  // Manage the spotlight state: build tiles, calculate spotlight, and manage video.
+  // This is the single source of truth for both the in-app panel and browser PiP.
+
+  // Ticking clock: updates every 250ms while in call.
+  let tickingNow = $state(0);
+  let clockInterval: ReturnType<typeof setInterval> | null = null;
+
+  $effect(() => {
+    if (!transportState.inCall) {
+      if (clockInterval) {
+        clearInterval(clockInterval);
+        clockInterval = null;
+      }
+      return;
+    }
+    if (!clockInterval) {
+      tickingNow = performance.now();
+      clockInterval = setInterval(() => {
+        tickingNow = performance.now();
+      }, 250);
+    }
+    return () => {
+      if (clockInterval) {
+        clearInterval(clockInterval);
+        clockInterval = null;
+      }
+    };
+  });
+
+  // Previous spotlight ID, for fallback (rule 4).
+  let spotlightPrevious = $state<string | null>(null);
+
+  // Build tiles with the unified builder and track start times.
+  const tiles = $derived.by<SpotlightTile[]>(() => {
+    const id = selfId();
+    const callState: CallState = {
+      participants: transportState.participants,
+      localCameraStream: transportState.localCameraStream,
+      localScreenStream: transportState.localScreenStream,
+      cameraOff: transportState.cameraOff,
+      watchingTransmissionPeerId: transportState.watchingTransmissionPeerId,
+      watchingTransmissionProducerId: transportState.watchingTransmissionProducerId,
+      selfId: id,
+      trackStartTimes,
+    };
+    return buildTilesWithTracking(callState);
+  });
+
+  // Calculate spotlight.
+  const spotlightTileId = $derived(
+    spotlight(
+      tiles,
+      callFocus.pinnedTileId,
+      transportState.watchingTransmissionPeerId,
+      speakers,
+      spotlightPrevious,
+      tickingNow
+    )
+  );
+
+  const spotlightTile = $derived(tiles.find((t) => t.id === spotlightTileId));
+
+  // Update the previous spotlight when it changes.
+  $effect(() => {
+    spotlightPrevious = spotlightTileId;
+  });
+
+  // Update the public spotlight store for the panel and PiP to read.
+  $effect(() => {
+    spotlightStore.tiles = tiles;
+    spotlightStore.spotlightTileId = spotlightTileId;
+    spotlightStore.spotlightTile = spotlightTile ?? null;
+  });
+
+  // Bind the PiP video element to the spotlight track.
+  let pipVideoElement: HTMLVideoElement | null = $state(null);
+  $effect(() => {
+    spotlightStore.pipVideoElement = pipVideoElement;
+  });
+
+  // Update both the PiP video and the panel's video on spotlight change.
+  // The spec constraint is: "a spotlight change must swap srcObject on ONE
+  // element, never remount". We update both elements' srcObject but don't
+  // remount either. This keeps browser PiP following along and keeps the
+  // panel displaying the spotlight.
+  // Keyed on the TRACK and the tile id, not the tile object: tiles are
+  // rebuilt whenever participants change, and assigning a fresh MediaStream
+  // to a <video> restarts it (a black frame each time). The stream is kept
+  // and only replaced when what it carries actually changes.
+  const spotlightTrack = $derived(spotlightTile?.videoTrack ?? null);
+  const spotlightKey = $derived(
+    spotlightTile ? `${spotlightTile.id}:${spotlightTrack?.id ?? "avatar"}` : null
+  );
+  const spotlightFit = $derived(
+    spotlightTile?.kind === "camera" ? "cover" : "contain"
+  );
+  let spotlightStream: MediaStream | null = null;
+  let spotlightStreamKey: string | null = null;
+  $effect(() => {
+    if (!pipVideoElement) return;
+    const panelVideoElement = spotlightStore.panelVideoElement;
+    const tile = spotlightTile;
+    if (spotlightKey !== spotlightStreamKey) {
+      spotlightStreamKey = spotlightKey;
+      if (spotlightTrack) {
+        spotlightStream = new MediaStream([spotlightTrack]);
+      } else if (tile) {
+        // No video: a still of the avatar, drawn once per spotlight change.
+        const label =
+          transportState.peerNames.get(
+            peerIdToDid(tile.peerId) || tile.peerId
+          ) ?? tile.peerId.slice(0, 8);
+        spotlightStream = createCanvasPlaceholder(label, label.charAt(0));
+      } else {
+        spotlightStream = null;
+      }
+    }
+    for (const el of [pipVideoElement, panelVideoElement]) {
+      if (!el) continue;
+      if (el.srcObject !== spotlightStream) el.srcObject = spotlightStream;
+      el.style.objectFit = spotlightFit;
+    }
+    const label = tile
+      ? (transportState.peerNames.get(peerIdToDid(tile.peerId) || tile.peerId) ??
+        tile.peerId.slice(0, 8))
+      : "";
+    setPipSource(spotlightStream, label, spotlightFit);
+  });
+
+  // Wire up browser PiP event handlers on the video element.
+  $effect(() => {
+    if (!pipVideoElement) return;
+    const onEnter = () => {
+      callPipPanel.browserPip = true;
+    };
+    const onLeave = () => {
+      callPipPanel.browserPip = false;
+    };
+    pipVideoElement.addEventListener("enterpictureinpicture", onEnter);
+    pipVideoElement.addEventListener("leavepictureinpicture", onLeave);
+    return () => {
+      pipVideoElement?.removeEventListener("enterpictureinpicture", onEnter);
+      pipVideoElement?.removeEventListener("leavepictureinpicture", onLeave);
+    };
+  });
+
+  // Wire up Media Session auto-PiP handler (for Chromium tab switch).
+  // When the browser's Media Session initiates PiP, this handler is called.
+  $effect(() => {
+    if (!transportState.inCall || !pipVideoElement || !displayPrefs.callPip) {
+      setOnPictureInPictureEnter(null);
+      return;
+    }
+
+    const handler = async () => {
+      // Nothing to see in a voice-only call: an avatar floating over another
+      // tab is noise, not a call. The user can still open it by hand.
+      if (!spotlightTrack) return;
+      await enterBrowserPip(() => void returnToCall());
+    };
+
+    setOnPictureInPictureEnter(handler);
+  });
+
+  // The palette cannot navigate on its own: this component owns activeRoomCode,
+  // the history push, and the room-name broadcast. Reproducing that inside the
+  // palette would fork the join path, so it delegates back here.
+  //
+  // activeRoomCode is a getter, not a snapshot, or the palette would read a
+  // stale room for the whole time it is mounted.
+  const paletteHost: PaletteHost = {
+    get activeRoomCode() {
+      return activeRoomCode;
+    },
+    openRoom: (code) => void handleSelectRoom(code),
+    joinRoomByCode: (code) => void handleJoin(code, ""),
+    openDm: (peerId) => void handleSelectDm(peerId),
+    leaveRoom: handleLeave,
+    removeRoom: (code) => void handleRemoveRoom(code),
+    openCreateJoin,
+  };
 
   // Manifest shortcut: long-press the installed icon > "New room".
   // The param is stripped so a later reload does not reopen the dialog.
@@ -756,14 +1056,44 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
   });
 </script>
 
-<svelte:window onpopstate={handlePopState} />
+<svelte:window
+  onpopstate={handlePopState}
+  onkeydown={(e) => {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+    const key = e.key.toLowerCase();
+
+    // Cmd/Ctrl+K opens the command palette. preventDefault is required even
+    // though nothing here claims the key: Firefox maps it to the search bar.
+    // Stays enabled on mobile, unlike the sidebar shortcut, because an external
+    // keyboard is the whole point of it.
+    if (key === "k") {
+      e.preventDefault();
+      if (!identityStore.isUnlocked) return;
+      paletteOpen = !paletteOpen;
+      return;
+    }
+
+    // Cmd/Ctrl+B collapses the room sidebar. The composer is a plain
+    // textarea, so there is no native bold to steal.
+    if (key !== "b") return;
+    if (isMobile) return;
+    e.preventDefault();
+    setSidebarCollapsed(!displayPrefs.sidebarCollapsed);
+  }}
+/>
 
 <QueryClientProvider client={queryClient}>
-  {#if identityStore.loading && !identityStore.keypair}
-    <div class="min-h-screen bg-background flex items-center justify-center">
-      <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
-    </div>
-  {:else if joiningRoom}
+  <!-- No "loading && !keypair" spinner here, and it must not come back.
+       identityStore.loading goes true for EVERY identity operation, not just
+       the first load, and keypair stays null right through signup - the
+       wizard holds its new keypair locally until the last step. So enrolling
+       biometrics mid-signup swapped IdentitySetup out for a spinner and back
+       in again, and a remounted IdentitySetup resets to its "entry" step:
+       cancelling the authenticator prompt dropped the user back on "create a
+       new identity" with the password, mnemonic and keypair they had just
+       generated all gone. The genuine first-load spinner is App.svelte's,
+       gated on identityStore.initializing, which is what that flag is for. -->
+  {#if joiningRoom}
     <div class="min-h-screen bg-background flex items-center justify-center">
       <div class="w-2 h-2 rounded-full bg-muted-foreground animate-pulse"></div>
     </div>
@@ -808,6 +1138,9 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
         onRemoveRoom={handleRemoveRoom}
         onOpenCreateJoin={openCreateJoin}
         onOpenPhonebook={() => (phonebookOpen = true)}
+        collapsed={!isMobile && displayPrefs.sidebarCollapsed}
+        onToggleCollapsed={() =>
+          setSidebarCollapsed(!displayPrefs.sidebarCollapsed)}
       />
       <div class="flex-1 min-w-0">
         {#if activeRoomCode}
@@ -940,7 +1273,7 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
 
             {#if starred.length > 0}
               <div
-                class="px-2 py-1 text-xs font-semibold text-muted-foreground uppercase tracking-wider font-mono"
+                class="select-none px-2 py-1 text-xs font-semibold text-muted-foreground uppercase tracking-wider font-mono"
               >
                 Starred
               </div>
@@ -1012,7 +1345,7 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
             {#if regular.length > 0}
               {#if starred.length > 0}
                 <div
-                  class="px-2 py-1 text-xs font-semibold text-muted-foreground uppercase tracking-wider font-mono mt-4"
+                  class="select-none px-2 py-1 text-xs font-semibold text-muted-foreground uppercase tracking-wider font-mono mt-4"
                 >
                   Contacts
                 </div>
@@ -1112,7 +1445,7 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
 
               {#if starred.length > 0}
                 <div
-                  class="px-2 py-1 text-xs font-semibold text-muted-foreground uppercase tracking-wider font-mono"
+                  class="select-none px-2 py-1 text-xs font-semibold text-muted-foreground uppercase tracking-wider font-mono"
                 >
                   Starred
                 </div>
@@ -1189,7 +1522,7 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
               {#if regular.length > 0}
                 {#if starred.length > 0}
                   <div
-                    class="px-2 py-1 text-xs font-semibold text-muted-foreground uppercase tracking-wider font-mono mt-4"
+                    class="select-none px-2 py-1 text-xs font-semibold text-muted-foreground uppercase tracking-wider font-mono mt-4"
                   >
                     Contacts
                   </div>
@@ -1276,4 +1609,41 @@ import { displayPrefs } from "$lib/display-prefs.svelte";
   <ReloadPrompt />
 
   <TransportStatus />
+
+  <!--
+    Here, not inside ChatView or the call view: both unmount when the user
+    leaves the conversation or the call ends, and a floating panel that dies
+    with the surface it was opened from is not floating.
+  -->
+  <FloatingDmPanel onExpand={expandDmPanel} />
+  <CallPipPanel />
+
+  <!--
+    Browser PiP video element: lives at app level so it is available for both
+    the in-app panel and the stage's PiP button (which queries it with the
+    data attribute). Only rendered when in a call. Bound to the spotlight track
+    regardless of whether the panel is showing.
+  -->
+  {#if transportState.inCall}
+    <!-- Visually hidden, NOT display:none: requestPictureInPicture needs a
+         video that is actually playing frames, and a display:none element is
+         not rendered at all. -->
+    <video
+      bind:this={pipVideoElement}
+      data-call-pip-video
+      class="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
+      autoplay
+      muted
+      playsinline
+    ></video>
+  {/if}
+
+  <!-- Also outside the unlocked branch, for the same reason: mounting it once
+       here means the palette survives lock/unlock and room switches, and it is
+       reachable whether or not a room is open. It is gated on isUnlocked because
+       every command needs an identity, and because openSettings' consumer only
+       exists in the unlocked tree. -->
+  {#if identityStore.isUnlocked}
+    <CommandPalette bind:open={paletteOpen} host={paletteHost} />
+  {/if}
 </QueryClientProvider>

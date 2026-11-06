@@ -15,25 +15,20 @@ const STUN_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.cloudflare.com:3478" },
 ];
 
-// Static TURN for awful.frav.in - only a FALLBACK, used until the relay hands
-// out short-lived HMAC credentials (see refreshTurnCredentials). Shipping a
-// permanent shared secret lets anyone relay through the server, so the relay's
-// /turn-credentials endpoint (coturn use-auth-secret) supersedes this whenever
-// TURN_SECRET is configured.
-const STATIC_TURN: RTCIceServer = {
-  urls: [
-    "turn:awful.frav.in:3478?transport=udp",
-    "turn:awful.frav.in:3478?transport=tcp",
-    // Port 5349 (both turn: and turns:) is dropped, not refused - a TCP
-    // connect there times out rather than failing fast, so the two entries
-    // that used to live here cost every peer connection a full connect
-    // timeout before ICE could give up on them. Put them back the moment
-    // coturn is actually listening on 5349 with a certificate: TLS TURN is
-    // what restrictive mobile carriers still let through.
-  ],
-  username: "awful",
-  credential: "awful",
-};
+// No static TURN credentials ship in the bundle any more.
+//
+// They used to: username "awful", password "awful", readable by anyone who
+// opened the JS, which made the server an open relay for the whole internet.
+// The people that hurts first are the ones who NEED TURN - mobile and CGNAT
+// users, who cannot connect directly - because the relay port range is finite
+// and a stranger exhausting it does not slow those users down, it locks them
+// out. coturn now runs with --use-auth-secret, so a permanent credential
+// could not work even if one were shipped.
+//
+// TURN now comes only from /turn-credentials (see refreshTurnCredentials),
+// which mints a short-lived HMAC per client. Until that answers, the list is
+// STUN-only: peers that can connect directly still do, and relayed peers get
+// TURN a moment later, on the first refresh.
 
 // ponytail: openrelay.metered.ca was the "last resort" TURN and its domain no
 // longer resolves, so all three entries were dead weight on every connection -
@@ -44,39 +39,69 @@ function withTurn(turn: RTCIceServer): RTCIceServer[] {
   return [...STUN_SERVERS, turn];
 }
 
-// Current ICE server list. Starts with the static TURN fallback and is upgraded
-// in place to short-lived credentials once refreshTurnCredentials() succeeds.
-let cached: RTCIceServer[] = withTurn(STATIC_TURN);
+// Current ICE server list. STUN only until refreshTurnCredentials() lands a
+// credentialled TURN entry.
+let cached: RTCIceServer[] = [...STUN_SERVERS];
+
+// Pending self-refresh timer. connect() calls refreshTurnCredentials() once
+// per session today, but nothing enforces that, and the function also
+// calls itself - so every call clears whatever is already pending first,
+// and only one refresh chain is ever running at a time.
+// The handle type differs between the browser and Node, and @types/node is in
+// scope here, so it is named rather than pinned to `number`.
+type TimerHandle = ReturnType<typeof setTimeout>;
+let refreshTimer: TimerHandle | undefined;
 
 /** ICE servers for a new RTCPeerConnection. Read synchronously at PC creation. */
 export function getIceServers(): RTCIceServer[] {
   return cached;
 }
 
+/** Test seam: a fresh module per case is not worth a vi.resetModules dance. */
+export function _resetIceServersForTest(): void {
+  clearTimeout(refreshTimer);
+  refreshTimer = undefined;
+  cached = [...STUN_SERVERS];
+}
+
 /**
  * Fetch short-lived TURN credentials from the relay and swap them into the
  * cached ICE list. Best-effort: on any failure (endpoint absent, TURN_SECRET
- * unset → 204, network error, malformed body) the static fallback stays in
- * place so calls/transfers keep working. Cheap to call on every connect.
+ * unset → 204, network error, malformed body) the list stays STUN-only, so
+ * peers that can connect directly still do and only relayed ones are
+ * affected. Cheap to call on every connect, and worth retrying: without it a
+ * mobile or CGNAT peer has no path at all.
+ *
+ * Self-schedules its own next call at HALF the credential's ttl. awful.chat
+ * is a PWA - a tab can live for days - and this used to run once per
+ * session with no timer at all: two hours after connect(), coturn started
+ * rejecting every new allocation because the credential's embedded expiry
+ * timestamp had passed, and every RTCPeerConnection created after that
+ * point gathered zero relay candidates, silently (relay-audit.md
+ * finding 3). Re-arming at half the ttl, not on failure, means a relayed
+ * call already in progress always holds a credential with most of its
+ * lifetime still ahead of it.
  */
 export async function refreshTurnCredentials(): Promise<void> {
+  clearTimeout(refreshTimer);
+  refreshTimer = undefined;
   try {
     const base =
       (import.meta.env.VITE_API_URL as string | undefined) ||
       "https://awful.frav.in";
     const res = await fetch(`${base}/turn-credentials`);
-    if (!res.ok) return; // error → keep fallback
+    if (!res.ok) return; // error → stay STUN-only, try again next connect
     // 204 is the relay saying TURN_SECRET is unset. It is a documented,
     // supported state, not a fault - and it is `ok`, so it has to be caught
     // here or it falls through to a JSON parse of an empty body.
     if (res.status === 204) return;
     // A host that answers an unrouted path with index.html returns 200 too, so
     // res.ok is not enough on its own: the JSON parse below would throw into
-    // the silent catch and leave the static credentials in place with nothing
-    // logged. That is what a deploy without VITE_API_URL looks like.
+    // the silent catch and leave the list STUN-only with nothing logged. That
+    // is what a deploy without VITE_API_URL looks like.
     if (!res.headers.get("content-type")?.includes("application/json")) {
       console.warn(
-        "[ice] /turn-credentials did not return JSON - still using the static TURN credentials"
+        "[ice] /turn-credentials did not return JSON - no TURN available, relayed peers will not connect"
       );
       return;
     }
@@ -84,6 +109,7 @@ export async function refreshTurnCredentials(): Promise<void> {
       username?: unknown;
       credential?: unknown;
       urls?: unknown;
+      ttl?: unknown;
     };
     if (
       typeof d?.username !== "string" ||
@@ -99,8 +125,18 @@ export async function refreshTurnCredentials(): Promise<void> {
       username: d.username,
       credential: d.credential,
     });
+    // ttl is in seconds (relay/turn.go). A missing or unusable ttl leaves
+    // this credential unrefreshed until the next connect() - the same
+    // fallback the old, never-refreshed code had - rather than guessing a
+    // number the relay did not send.
+    if (typeof d.ttl === "number" && Number.isFinite(d.ttl) && d.ttl > 0) {
+      refreshTimer = setTimeout(
+        () => void refreshTurnCredentials(),
+        (d.ttl * 1000) / 2
+      );
+    }
   } catch {
-    // keep the static fallback
+    // Stay STUN-only. The next connect() calls this again.
   }
 }
 

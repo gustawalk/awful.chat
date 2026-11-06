@@ -6,6 +6,34 @@ third-party code at runtime, no server-side plugin logic, no sandboxing:
 plugins share the exact trust level of the app bundle itself, because the
 operator already ships all the code every visitor runs.
 
+## Status: shipped, and grown past this plan
+
+This document is the original v1 design and review record; everything in it
+was built. The living author contract is `frontend/plugins/README.md` - when
+this file and the README disagree, the README wins. What has grown since:
+
+- Manifest gained `name`-adjacent metadata: `version`, `author`, `license`,
+  `repository` (the settings page groups plugins by repository origin and
+  links it), and `icon` accepts `lucide:*` names, not just emoji.
+- External plugin sources: the frontend Dockerfile fetches extra plugin repos
+  at build time via `PLUGIN_SOURCES` (e.g. `awful-org/awfully-awesome#<sha>`; an unpinned
+  entry fails the build unless `PLUGIN_SOURCES_ALLOW_UNPINNED=1`),
+  deleting any fetched `.gitignore` so Tailwind scans their markup. A
+  pre-commit hook keeps fetched plugins out of the app repo.
+- Host API grew: `cards()` and `sendUpdateImmediately` (host-bound, room
+  targeted), a now-playing media surface (`setNowPlaying`), and call-view
+  plugin TILES with join presence - the "no surfaces outside chat" non-goal
+  fell (waffle-party exercises all of it).
+- A server-side component exists after all: the relay's plugin proxy
+  (`PLUGIN_PROXY_HOSTS` / `PLUGIN_PROXY_SECRETS`) so plugins can call
+  allowlisted third-party APIs without leaking client IPs or shipping keys.
+- Signatures moved to sigV 3 (canonical binds type + roomCode); the "zero
+  signature-format changes" note below describes the v2 era.
+- Settings panel leads with a trust notice (plugins are unvetted, run with
+  app-level access, can degrade performance).
+- Reference plugins: wheel took an optional question (`/wheel Question? a, b`),
+  and poll shipped as planned.
+
 ## Goals
 
 - Adding a plugin = dropping a folder in `frontend/plugins/` and redeploying.
@@ -47,8 +75,11 @@ interface PluginManifest {
 
 interface PluginDefinition {
   manifest: PluginManifest;
-  // Svelte component rendering a card. Props: { card, state, host }.
-  card?: Component;
+  // Svelte component rendering a card. Props: { card, cardState, host }.
+  // cardState, never state: a prop called `state` shadows the $state rune
+  // in any card that uses runes. This doc said `state` for a while and the
+  // ping plugin followed it, so its state prop was never populated.
+  card?: PluginComponent;
   // Pure reducer. Host feeds persisted updates in lamport order (history
   // replay first, then live), ephemeral updates live only.
   reduce?: (state: unknown, update: PluginUpdate, ctx: UpdateCtx) => unknown;
@@ -162,12 +193,32 @@ New: `src/lib/plugins/state.svelte.ts`.
 
 `MsgRender.svelte` gets a `PluginCard` branch: look up pluginId in the
 registry, lazy-load the plugin chunk (skeleton while loading), mount the
-card component with `{ card, state, host }`. Fallback card for unknown or
+card component with `{ card, cardState, host }`. Fallback card for unknown or
 disabled plugins shows icon-less neutral chip with the plugin id. Card width
 constraints match existing file cards. PluginUpdate messages render nothing
 (they are data, not chat lines), but they must not break pagination or unread
 counts: they are excluded from the unread badge the same way reactions are
 (verify how Reaction is counted and mirror it).
+
+### Shared components
+
+Plugins may render a small set of host components, exported from
+`$lib/plugins/ui`:
+
+| Export | What it is |
+| --- | --- |
+| `Tip` | Tooltip for one control. Preferred over the native `title` attribute, which cannot be styled and has a browser-controlled delay. |
+
+That module is the contract. A plugin importing `$lib/components/...`
+directly would make every file under that folder public API by accident,
+unversioned, so tidying it up would silently break plugins the host never
+sees. Anything exported from `$lib/plugins/ui` is a compatibility promise
+covered by the manifest's `apiVersion`.
+
+Keep the list to components that are genuinely self-contained - no host
+state, no assumptions about where they are mounted - and prefer growing the
+`HostApi` over growing this list: data is a smaller promise to keep than
+layout.
 
 ## 5. Slash commands
 

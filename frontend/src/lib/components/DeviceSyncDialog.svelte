@@ -108,11 +108,24 @@ import {
     await generateSyncCode();
   }
 
-  function handleCopyToken() {
-    if (syncState.plaintextToken) {
-      navigator.clipboard.writeText(syncState.plaintextToken);
+  let tokenCopied = $state(false);
+
+  async function handleCopyToken() {
+    if (!syncState.plaintextToken) return;
+    try {
+      await navigator.clipboard.writeText(syncState.plaintextToken);
+      tokenCopied = true;
+      setTimeout(() => (tokenCopied = false), 1500);
+    } catch {
+      // Clipboard blocked - an insecure origin, or permission refused,
+      // which is common on a phone. Say so rather than looking like the
+      // button did nothing: the code is on screen and can be typed.
+      copyFailed = true;
+      setTimeout(() => (copyFailed = false), 3000);
     }
   }
+
+  let copyFailed = $state(false);
 
 async function handleStartScanning() {
   view = "scan";
@@ -143,7 +156,18 @@ async function handleStartScanning() {
   }
 
   async function handleSubmitManualToken() {
-    const payload = parsePlaintextToken(manualToken.trim());
+    let payload: SyncPayload | null;
+    try {
+      // Throws (rather than returning null) for a code from before peerId
+      // pinning existed, with a message telling the user to update both
+      // devices - that's distinct from a plain typo/garbage input.
+      payload = parsePlaintextToken(manualToken.trim());
+    } catch (err) {
+      syncState.syncError =
+        err instanceof Error ? err.message : "Invalid sync code format";
+      view = "error";
+      return;
+    }
     if (!payload) {
       syncState.syncError = "Invalid sync code format";
       view = "error";
@@ -325,10 +349,20 @@ async function handleStartScanning() {
                 variant="outline"
                 size="icon"
                 class="shrink-0"
+                aria-label={tokenCopied ? "Copied" : "Copy sync code"}
               >
-                <Copy class="w-4 h-4" />
+                {#if tokenCopied}
+                  <Check class="w-4 h-4 text-primary" />
+                {:else}
+                  <Copy class="w-4 h-4" />
+                {/if}
               </Button>
             </div>
+            {#if copyFailed}
+              <p class="text-xs text-muted-foreground">
+                Could not reach the clipboard. Type the code instead.
+              </p>
+            {/if}
           </div>
 
           {#if syncState.isConnecting}
@@ -374,11 +408,12 @@ async function handleStartScanning() {
       {:else if view === "manual-input"}
         <div class="space-y-4">
           <p class="text-sm text-muted-foreground">
-            Enter the sync code shown on your other device.
+            Enter the sync code shown on your other device (three groups of
+            eight characters, separated by dashes).
           </p>
           <Input
             bind:value={manualToken}
-            placeholder="ABC123:DEF456"
+            placeholder="abcd1234-abcd1234-abcd1234"
             class="font-mono text-center uppercase"
             onkeydown={(e) => {
               if (e.key === "Enter" && manualToken.trim()) {

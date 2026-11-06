@@ -37,8 +37,28 @@
    *
    * pr-28 keeps the text clear of the icon buttons the caller overlays on the
    * right; widen it if a button is added there.
+   *
+   * The font comes from the chat font properties so what you type matches what
+   * you just read. `leading-normal` replaces the old fixed `leading-5`: a
+   * 1.25rem line box clips once the chosen size passes it, and it clips the
+   * mirror and the textarea by different amounts, which drifts the mention
+   * chips off their glyphs.
    */
-  const BOX = "border py-2 pl-3 pr-28 font-mono text-sm leading-5";
+  /**
+   * A FIXED text size, deliberately not the chat font size.
+   *
+   * The composer used to scale with the message font, which grew the box until
+   * it scrolled - the complaint that moved --chat-font-size onto the message
+   * list in the first place. It then kept referencing that variable from a
+   * place the variable no longer reaches, so `var()` resolved to nothing, the
+   * font-size declaration was dropped, and the box inherited a size it was not
+   * laid out for and scrolled again for a different reason.
+   *
+   * The chosen font FAMILY still applies: that variable stays on the chat root
+   * on purpose, so the composer matches what you are reading.
+   */
+  const BOX =
+    "border py-2 pl-3 pr-28 font-(family-name:--chat-font-family) text-sm leading-normal";
 
   let scrollTop = $state(0);
   /**

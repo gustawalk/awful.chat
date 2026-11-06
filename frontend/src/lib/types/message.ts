@@ -14,6 +14,7 @@ export enum MessageType {
   CallState = "call_state",
   WatchPresence = "watch_presence",
   VoiceRedial = "voice_redial",
+  VoiceSignal = "voice_signal",
   RoomName = "room_name",
   PluginEphemeral = "plugin_ephemeral",
   // room users - wire only, never persisted
@@ -79,6 +80,14 @@ export interface Attachment {
   infoHash: string; // permanent WebTorrent reference
   data?: ArrayBuffer; // only if size < 5MB
   blobURL?: string; // runtime only, never persisted
+  /**
+   * Intrinsic pixel size, when the sender could measure it. Optional because
+   * an older sender does not send it and because not everything is an image;
+   * both cases render the way they always did. Untrusted on arrival - see
+   * isSaneDimension.
+   */
+  width?: number;
+  height?: number;
   status: AttachmentStatus;
   createdAt: number;
 }
@@ -117,6 +126,14 @@ export interface FileEntry {
    * receipt, so they cannot be forged.
    */
   inline?: string;
+  /**
+   * Intrinsic pixel size, when the sender could measure it. Optional because
+   * an older sender does not send it and because not everything is an image;
+   * both cases render the way they always did. Untrusted on arrival - see
+   * isSaneDimension.
+   */
+  width?: number;
+  height?: number;
 }
 
 // ── Wire shapes ───────────────────────────────────────────────────────────────
@@ -165,6 +182,14 @@ export interface WireProfile {
   tagChipColor?: string;
   bio?: string;
   nameEffect?: string;
+  /**
+   * The composable half of the name effect. nameEffect stays the closest
+   * single-effect approximation so a peer on an older build still renders
+   * something; these two carry what that approximation cannot express, and
+   * an older build simply ignores fields it does not know.
+   */
+  nameShimmer?: boolean;
+  nameGlow?: boolean;
   gradient2?: string | null;
   gradient3?: string | null;
 }
@@ -191,6 +216,18 @@ export interface WireCallState {
  */
 export interface WireVoiceRedial {
   type: MessageType.VoiceRedial;
+}
+
+/**
+ * WebRTC voice signalling (offer/answer/ICE) over the app transport's
+ * confirmed direct streams. A dedicated /voice/ protocol stream had no
+ * delivery proof: opened on a connection whose far side was gone (what a
+ * reload leaves behind), it reported success while every offer vanished.
+ */
+export interface WireVoiceSignal {
+  type: MessageType.VoiceSignal;
+  /** Validated by isVoiceSignal() in voice.ts before it touches the pc. */
+  signal: unknown;
 }
 
 export interface WireWatchPresence {
@@ -251,6 +288,13 @@ export interface WireSyncBatch {
   messages: WireChatMessage[];
   batchIndex: number;
   totalBatches: number;
+  /**
+   * This batch is the direct copy of a live send, not history repair. The
+   * receiver announces a live batch (sound, notification) and stays quiet for
+   * repair, which would otherwise beep once per recovered message. Absent from
+   * older senders, which is why quiet is the default.
+   */
+  live?: boolean;
 }
 
 export interface WireSyncComplete {
@@ -270,6 +314,7 @@ export type AnyWireMessage =
   | WireChatMessage
   | WireProfile
   | WireVoiceRedial
+  | WireVoiceSignal
   | WireCallPresence
   | WireWatchPresence
   | WireCallState
@@ -283,6 +328,19 @@ export type AnyWireMessage =
   | WireSyncComplete;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * The reply snapshot is unsigned and unbounded on the wire, so a sender can
+ * attach an arbitrarily long "quote" to an otherwise ordinary message and have
+ * every recipient store it. Nothing renders more than a truncated line of it.
+ */
+const MAX_REPLY_SNAPSHOT = 2048;
+
+export function boundReplyTo(r: ReplyTo | undefined): ReplyTo | undefined {
+  if (!r || typeof r.content !== "string") return r;
+  if (r.content.length <= MAX_REPLY_SNAPSHOT) return r;
+  return { ...r, content: r.content.slice(0, MAX_REPLY_SNAPSHOT) };
+}
 
 /** Reconstruct a full Message from a WireChatMessage on the receiving end. */
 export function wireToMessage(
@@ -303,7 +361,7 @@ export function wireToMessage(
     content: wire.content,
     meta: wire.meta,
     attachments: [],
-    replyTo: wire.replyTo,
+    replyTo: boundReplyTo(wire.replyTo),
     reactionTo: wire.reactionTo,
     reactionEmoji: wire.reactionEmoji,
     reactionOp: wire.reactionOp,

@@ -27,15 +27,22 @@
     setVoiceDtlnNoiseGate,
     getVoiceDtlnNoiseGate,
   } from "$lib/transport/voice.svelte";
-  import { setDeafened, toggleMute } from "$lib/transport/call.svelte";
+  import {
+    setDeafened,
+    toggleMute,
+    getShareAudioDespiteEchoRisk,
+    setShareAudioDespiteEchoRisk,
+  } from "$lib/transport/call.svelte";
   import {
     formatGain,
     gainToSlider,
     sliderToGain,
   } from "$lib/audio/volume-curve";
 
+  // Mirrors the call path in libp2p/voice.ts (the mic test must preview what
+  // peers actually get): AEC on even with DTLN - DTLN does noise, not echo.
   const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
-    echoCancellation: false,
+    echoCancellation: true,
     noiseSuppression: false,
     autoGainControl: false,
   };
@@ -43,11 +50,16 @@
   const AUDIO_CONSTRAINTS_NO_DTLN: MediaTrackConstraints = {
     echoCancellation: true,
     noiseSuppression: true,
-    autoGainControl: false,
+    // Mirrors the call path: AGC levels the mic there, so the test must too.
+    autoGainControl: true,
   };
 
   let inputDevices = $state<MediaDeviceInfo[]>([]);
   let outputDevices = $state<MediaDeviceInfo[]>([]);
+  // Device enumeration is async: swapping the fallback line for the taller
+  // Select once it lands shifted the whole tab. A select-sized skeleton
+  // holds the height until we know which one renders.
+  let devicesLoaded = $state(false);
   let activeInput = $state<string | null>(null);
   let activeOutput = $state<string | null>(null);
 
@@ -55,6 +67,9 @@
   // Restored from the last session, not a fresh default.
   let noiseGateThreshold = $state(getVoiceDtlnNoiseGate());
   let noiseGateSlider = $state<number[]>([getVoiceDtlnNoiseGate() * 10000]);
+  // Off by default: screen-share audio that could not be confirmed
+  // echo-free is withheld unless the sharer opts in here (share-audio.ts).
+  let shareAudioDespiteEchoRisk = $state(getShareAudioDespiteEchoRisk());
 
   let isMicTesting = $state(false);
   // Distinct from isMicTesting: set only during async startup so a second
@@ -97,11 +112,15 @@
     activeOutput = getVoiceActiveOutputDevice();
     inputSlider = [liveInputSlider()];
     outputSlider = [liveOutputSlider()];
-    getVoiceInputDevices().then((d) => {
-      inputDevices = d;
-    });
-    getVoiceOutputDevices().then((d) => {
-      outputDevices = d;
+    void Promise.allSettled([
+      getVoiceInputDevices().then((d) => {
+        inputDevices = d;
+      }),
+      getVoiceOutputDevices().then((d) => {
+        outputDevices = d;
+      }),
+    ]).then(() => {
+      devicesLoaded = true;
     });
   });
 
@@ -158,6 +177,13 @@
     if (isMicStarting) return;
     isMicStarting = true;
 
+    // Kept outside the try so the catch can clean up a half-built test:
+    // the mic capture and the monitor graph exist before micTestDisconnect is
+    // assigned, and a lingering monitor blocks the transport edge of every
+    // future mic rebuild.
+    let testStream: MediaStream | null = null;
+    let dtlnCleanup: (() => void) | null = null;
+
     try {
       // Deafen when starting test (mutes both input and output)
       setDeafened(true);
@@ -176,13 +202,14 @@
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      testStream = stream;
 
       if (dtlnEnabled) {
         _dtln.disconnectFromTransport();
         await _dtln.waitUntilReady();
         _dtln.setNoiseGate(noiseGateThreshold);
-        const { processedStream, cleanup: dtlnCleanup } =
-          await _dtln.monitorStream(stream);
+        const { processedStream, cleanup } = await _dtln.monitorStream(stream);
+        dtlnCleanup = cleanup;
 
         const testCtx = new AudioContext();
         const source = testCtx.createMediaStreamSource(processedStream);
@@ -201,7 +228,7 @@
         }, 50);
 
         micTestDisconnect = () => {
-          dtlnCleanup();
+          dtlnCleanup?.();
           _dtln.reconnectToTransport();
           source.disconnect();
           testCtx.close?.();
@@ -241,6 +268,13 @@
       isMicTesting = true;
     } catch (e) {
       console.error("Mic test failed:", e);
+      // Failure can land with the setup half-built and micTestDisconnect not
+      // yet assigned: drop the monitor graph and the captured mic, then
+      // restore the transport edge (safe no-op when nothing was cut) - or a
+      // live call transmits silence from here on.
+      dtlnCleanup?.();
+      testStream?.getTracks().forEach((t) => t.stop());
+      _dtln.reconnectToTransport();
       micTestDisconnect?.();
       micTestDisconnect = null;
       setDeafened(false);
@@ -274,12 +308,14 @@
     <div class="flex items-center gap-2">
       <div class="w-1 h-4 bg-green-500 rounded-full"></div>
       <Label
-        class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+        class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
         >Microphone</Label
       >
     </div>
 
-    {#if inputDevices.length > 0}
+    {#if !devicesLoaded}
+      <div class="h-9 w-full animate-pulse rounded-md bg-muted/60"></div>
+    {:else if inputDevices.length > 0}
       <Select
         type="single"
         value={activeInput ?? ""}
@@ -337,7 +373,7 @@
       <div class="flex items-center gap-2">
         <div class="w-1 h-4 bg-blue-500 rounded-full"></div>
         <Label
-          class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+          class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
           >Noise Suppression</Label
         >
       </div>
@@ -420,12 +456,14 @@
     <div class="flex items-center gap-2">
       <div class="w-1 h-4 bg-orange-500 rounded-full"></div>
       <Label
-        class="text-xs font-mono text-muted-foreground uppercase tracking-wider"
+        class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
         >Speakers</Label
       >
     </div>
 
-    {#if outputDevices.length > 0}
+    {#if !devicesLoaded}
+      <div class="h-9 w-full animate-pulse rounded-md bg-muted/60"></div>
+    {:else if outputDevices.length > 0}
       <Select
         type="single"
         value={activeOutput ?? ""}
@@ -475,5 +513,32 @@
         class="w-full"
       />
     </div>
+  </div>
+
+  <!-- Screen Share Audio Section -->
+  <div
+    class="flex flex-col gap-4 p-4 bg-muted/30 rounded-lg border border-border/50"
+  >
+    <div class="flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <div class="w-1 h-4 bg-purple-500 rounded-full"></div>
+        <Label
+          class="select-none text-xs font-mono text-muted-foreground uppercase tracking-wider"
+          >Screen Share Audio</Label
+        >
+      </div>
+      <Switch
+        bind:checked={shareAudioDespiteEchoRisk}
+        onCheckedChange={(checked) => setShareAudioDespiteEchoRisk(checked)}
+      />
+    </div>
+    <p class="text-[10px] text-muted-foreground font-mono">
+      A screen share's audio is only sent when awful.chat can confirm it
+      will not echo everyone's own voice back to them (a per-window share
+      on Windows 11 / macOS 14.2+, or any share with the browser's
+      own-audio filter confirmed on). When it can't confirm that, audio is
+      dropped by default. Turn this on to send it anyway - people may hear
+      themselves with a delay.
+    </p>
   </div>
 </div>
